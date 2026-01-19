@@ -652,16 +652,16 @@ class CoopTrack(MVXTwoStageDetector):
         assert bev_embed.shape[0] == self.bev_h * self.bev_w
         return bev_embed, bev_pos
 
-    def load_detection_output_into_cache(self, track_instances: Instances, out):
+    def load_detection_output_into_cache(self, track_instances: Instances, out): # detection output을 track instance의 현재 프레임 cache에 넘겨줌
         """ Load output of the detection head into the track_instances cache (inplace)
         """
         with torch.no_grad():
-            track_scores = out['all_cls_scores'][-1, :].sigmoid().max(dim=-1).values
+            track_scores = out['all_cls_scores'][-1, :].sigmoid().max(dim=-1).values # query마다 confidence score 생성, [-1,:] => 마지막 decoder layer 결과만 사용
         track_instances.cache_scores = track_scores.clone()
-        track_instances.cache_logits = out['all_cls_scores'][-1].clone()
-        track_instances.cache_query_feats = out['query_feats'][-1].clone()
-        track_instances.cache_ref_pts = out['ref_pts'].clone()
-        track_instances.cache_bboxes = out['all_bbox_preds'][-1].clone()
+        track_instances.cache_logits = out['all_cls_scores'][-1].clone() # 마지막 layer의 raw logits 저장
+        track_instances.cache_query_feats = out['query_feats'][-1].clone() # 마지막 decoder layer의 query hidden state (다음 단계 STReasoner에서 history reasoning 입력으로 사용)
+        track_instances.cache_ref_pts = out['ref_pts'].clone() # 현재 frame query의 reference points
+        track_instances.cache_bboxes = out['all_bbox_preds'][-1].clone() # 마지막 decoder layer의 bbox prediction 저장
         track_instances.cache_query_embeds = self.query_embedding(pos2posemb3d(track_instances.cache_ref_pts))
         return track_instances
     
@@ -843,7 +843,7 @@ class CoopTrack(MVXTwoStageDetector):
                 if self.if_update_ego:
                     prev_active_track_instances = self.update_ego(prev_active_track_instances, 
                                                                 l2g_r1[i], l2g_t1[i], l2g_r2[i], l2g_t2[i])
-                prev_active_track_instances = self.STReasoner.sync_pos_embedding(prev_active_track_instances, self.query_embedding)
+                prev_active_track_instances = self.STReasoner.sync_pos_embedding(prev_active_track_instances, self.query_embedding) # positional embedding update
             
                 empty_track_instances = self._generate_empty_tracks()
                 full_length = len(empty_track_instances)
@@ -893,7 +893,7 @@ class CoopTrack(MVXTwoStageDetector):
                 'query_feats': query_feats[:, j, :, :],
             }
             # 1. Record the information into the track instances cache
-            cur_track_instances = self.load_detection_output_into_cache(cur_track_instances, cur_out)
+            cur_track_instances = self.load_detection_output_into_cache(cur_track_instances, cur_out) # Detection head에서 나온 출력을 track query에 삽입
             cur_out['track_instances'] = cur_track_instances
             
             # 2. loss for detection
@@ -905,7 +905,7 @@ class CoopTrack(MVXTwoStageDetector):
                 cur_loss.update(self.criterion.losses_dict)
             # extract motion feature
             if self.is_motion:
-                cur_track_instances = self.MotionExtractor(cur_track_instances, img_metas[j])
+                cur_track_instances = self.MotionExtractor(cur_track_instances, img_metas[j]) # bbox로부터 motion feature를 뽑아 tracker/temporal reasoner가 사용하게 만들기
 
             inf_instances = None
             if self.is_cooperation:
@@ -917,8 +917,8 @@ class CoopTrack(MVXTwoStageDetector):
                     'pred_boxes': kwargs['pred_boxes'][j][0],
                 }
                 if inf_dcit['query_feats'].shape[0] > 0:
-                    inf_dcit = self.crossview_alignment(inf_dcit, veh2inf_rt[j])
-                    inf_instances = self._init_inf_tracks(inf_dcit)
+                    inf_dcit = self.crossview_alignment(inf_dcit, veh2inf_rt[j]) # CAA
+                    inf_instances = self._init_inf_tracks(inf_dcit) # buffer 초기화 + history buffer의 마지막에 현재 frame 삽입
                 if self.STReasoner.learn_match:
                     mask = cur_track_instances.cache_scores > self.STReasoner.veh_thre
                     veh_boxes = cur_track_instances[mask].cache_bboxes.clone()
