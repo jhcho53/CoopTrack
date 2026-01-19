@@ -923,6 +923,7 @@ class CoopTrack(MVXTwoStageDetector):
                     mask = cur_track_instances.cache_scores > self.STReasoner.veh_thre
                     veh_boxes = cur_track_instances[mask].cache_bboxes.clone()
                     inf_boxes = inf_instances.cache_bboxes.clone()
+                    # veh_boxes와 inf_boxes를 각각 GT와 Hungarian matching으로 붙인 후, 같은 GT에 매칭된 veh-inf 쌍을 positive(1)로 표시한 association label matrix를 생성
                     asso_label = self.STReasoner._gen_asso_label(gt_bboxes_3d[j], inf_boxes, veh_boxes, img_metas[j]['sample_idx'])
             # 3. Spatial-temporal reasoning
             cur_track_instances, affinity = self.STReasoner(cur_track_instances, inf_instances)

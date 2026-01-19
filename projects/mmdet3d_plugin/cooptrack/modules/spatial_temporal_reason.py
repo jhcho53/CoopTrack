@@ -387,40 +387,48 @@ class SpatialTemporalReasoner(nn.Module):
     
     def _gen_asso_label(self, gt_boxes, inf_boxes, veh_boxes, sample_idx):
         with torch.no_grad():
-            inf_num = inf_boxes.shape[0]
-            veh_num = veh_boxes.shape[0]
+            inf_num = inf_boxes.shape[0] # infra 개수 파악
+            veh_num = veh_boxes.shape[0] # vehicle 개수 파악
             device = veh_boxes.device
             label = torch.zeros((veh_num, inf_num), dtype=torch.long, device=device)
+
+            # GT Box 준비
             gt_boxes = gt_boxes[0].tensor.to(device)
             gt_boxes = normalize_bbox(gt_boxes, self.pc_range)
             
+            # box1(veh or inf)과 box2(GT Box)를 거리 기반 cost로 Hungarian assignment해서 matching을 뽑음
             def hungarian_matching(box1, box2, thre=5.0):
                 box1_nums = box1.shape[0]
                 box2_nums = box2.shape[0]
-                cost_matrix = np.ones((box1_nums, box2_nums)) * 1e6
+                cost_matrix = np.ones((box1_nums, box2_nums)) * 1e6 # cost matrix 생성
 
                 box1_np = box1.cpu().numpy()
                 box2_np = box2.cpu().numpy()
+                # box의 (x,y) 중심점만을 사용
                 box1_np = box1_np[:, 0:2]
                 box2_np = box2_np[:, 0:2]
+                # 모든 pair 거리 계산
                 box1_repeat = np.repeat(box1_np[:, np.newaxis], box2_nums, axis=1)
                 distances = np.sqrt(np.sum((box1_repeat - box2_np)**2, axis=2))
-
+                # threshold 밖은 invalid 처리 (3m 이내에 있는 box pair만 매칭 후보로 인정)
                 mask = distances > 3.0
                 cost_matrix[~mask] = distances[~mask]
                 
+                # Hungarian assignment 수행
                 idx_row, idx_col = linear_sum_assignment(cost_matrix)
 
+                # assignment 결과가 cost<1e5 조건으로 진짜 valid 매칭만 남김
                 cost_mask = cost_matrix[idx_row, idx_col] < 1e5
-                row_accept_idx = idx_row[cost_mask]
-                col_accept_idx = idx_col[cost_mask]
+                row_accept_idx = idx_row[cost_mask] # box1 index
+                col_accept_idx = idx_col[cost_mask] # box2 index
                 return row_accept_idx, col_accept_idx
 
             # associate veh and gt
-            matched_veh_indices, mathced_gt_indices_from_v = hungarian_matching(veh_boxes, gt_boxes)
+            matched_veh_indices, mathced_gt_indices_from_v = hungarian_matching(veh_boxes, gt_boxes) # veh <-> gt matching
             # associate inf and gt
-            matched_inf_indices, mathced_gt_indices_from_i = hungarian_matching(inf_boxes, gt_boxes)
+            matched_inf_indices, mathced_gt_indices_from_i = hungarian_matching(inf_boxes, gt_boxes) # inf <-> gt matching
 
+            # GT 기준으로 veh/inf를 묶기 위한 map 생성
             from collections import defaultdict
             gt_to_veh = defaultdict(list)
             for veh_idx, gt_idx in zip(matched_veh_indices, mathced_gt_indices_from_v):
@@ -430,6 +438,7 @@ class SpatialTemporalReasoner(nn.Module):
             for inf_idx, gt_idx in zip(matched_inf_indices, mathced_gt_indices_from_i):
                 gt_to_inf[gt_idx].append(inf_idx)
 
+            # 같은 GT를 공유하면 veh-inf positive pair, 해당 GT에 대해 veh도 매칭되고 inf도 매칭되었으면 같은 object로 판단
             pairs = []
             for gt_idx in gt_to_veh:
                 if gt_idx in gt_to_inf:
@@ -438,7 +447,7 @@ class SpatialTemporalReasoner(nn.Module):
                             label[veh_idx, inf_idx] = 1
                             pairs.append((veh_idx, inf_idx, gt_idx))
 
-        return label
+        return label # label[i,j] =>   vc352q   Qveh i와 inf j는 같은 GT 객체
     
     def init_params_and_layers(self):
         # Modules for history reasoning
