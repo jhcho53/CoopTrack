@@ -168,6 +168,7 @@ class BEVFormerTrackHead(DETRHead):
         img_metas=None,
     ):
         assert bev_embed.shape[0] == self.bev_h * self.bev_w
+        # hs = 각 Decoder Layer의 Query Hidden states 
         hs, init_reference, inter_references = self.transformer.get_states_and_refs(
             bev_embed,
             query_feats,
@@ -184,20 +185,22 @@ class BEVFormerTrackHead(DETRHead):
         outputs_classes = []
         outputs_coords = []
         outputs_trajs = []
+        # Decoder Layer 별로 classification/regression 수행
         for lvl in range(hs.shape[0]):
             if lvl == 0:
                 # reference = init_reference
-                reference = ref_points
+                reference = ref_points # 첫 layer는 주어진 ref points를 그대로 reference로 사용
             else:
-                reference = inter_references[lvl - 1]
+                reference = inter_references[lvl - 1] # 다음 layer부터는 이전 layer에서 update된 reference를 사용
                 # ref_size_base = inter_box_sizes[lvl - 1]
             reference = inverse_sigmoid(reference)
-            outputs_class = self.cls_branches[lvl](hs[lvl])
-            tmp = self.reg_branches[lvl](hs[lvl])  # xydxdyxdz
+            outputs_class = self.cls_branches[lvl](hs[lvl]) # Classification head
+            tmp = self.reg_branches[lvl](hs[lvl])  # xydxdyxdz # Regression head
             # outputs_past_traj = self.past_traj_reg_branches[lvl](hs[lvl]).view(
             #     tmp.shape[0], -1, self.past_steps + self.fut_steps, 2)
             # TODO: check the shape of reference
             assert reference.shape[-1] == 3
+            # DETR 형태의 Box Refine
             tmp[..., 0:2] += reference[..., 0:2]
             tmp[..., 0:2] = tmp[..., 0:2].sigmoid()
             tmp[..., 4:5] += reference[..., 2:3]
@@ -206,7 +209,7 @@ class BEVFormerTrackHead(DETRHead):
             last_ref_points = torch.cat(
                 [tmp[..., 0:2], tmp[..., 4:5]], dim=-1,
             )
-
+            # Normalized된 값을 실제 좌표로 Denormalize
             tmp[..., 0:1] = (tmp[..., 0:1] * (self.pc_range[3] -
                              self.pc_range[0]) + self.pc_range[0])
             tmp[..., 1:2] = (tmp[..., 1:2] * (self.pc_range[4] -
@@ -222,6 +225,7 @@ class BEVFormerTrackHead(DETRHead):
             outputs_classes.append(outputs_class)
             outputs_coords.append(outputs_coord)
             # outputs_trajs.append(outputs_past_traj)
+        # Layer별 Output Stack
         outputs_classes = torch.stack(outputs_classes)
         outputs_coords = torch.stack(outputs_coords)
         # outputs_trajs = torch.stack(outputs_trajs)

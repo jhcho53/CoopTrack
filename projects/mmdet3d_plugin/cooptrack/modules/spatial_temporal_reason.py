@@ -559,8 +559,8 @@ class SpatialTemporalReasoner(nn.Module):
     def sync_pos_embedding(self, track_instances: Instances, mlp_embed: nn.Module = None):
         """Synchronize the positional embedding across all fields"""
         if mlp_embed is not None:
-            track_instances.query_embeds = mlp_embed(pos2posemb3d(track_instances.ref_pts))
-            track_instances.hist_position_embeds = mlp_embed(pos2posemb3d(track_instances.hist_xyz))
+            track_instances.query_embeds = mlp_embed(pos2posemb3d(track_instances.ref_pts)) # 현재 query의 positional embedding을 최신 ref_pts로 다시 생성
+            track_instances.hist_position_embeds = mlp_embed(pos2posemb3d(track_instances.hist_xyz)) # history buffer에 들어있는 모든 frame에 대해 positional embedding update
         return track_instances
     
     def update_ego(self, track_instances: Instances, l2g_r1, l2g_t1, l2g_r2, l2g_t2):

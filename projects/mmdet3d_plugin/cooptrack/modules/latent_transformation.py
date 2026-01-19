@@ -140,29 +140,36 @@ class LatentTransformation(nn.Module):
         return pred_boxes
 
     def forward(self, instances, veh2inf_rt):
-        calib_inf2veh = np.linalg.inv(veh2inf_rt.cpu().numpy().T)
+        calib_inf2veh = np.linalg.inv(veh2inf_rt.cpu().numpy().T) # veh2inf => inf2veh로 변환
         calib_inf2veh = instances['ref_pts'].new_tensor(calib_inf2veh)
+        # rot/trans 분리
         rot = calib_inf2veh[:3, :3].clone()
         trans = calib_inf2veh[:3, 3:4].clone()
 
+        # rotation을 6D 입력으로 만들기
         if self.rot_dims == 6:
             con_rot = self.continuous_rot(rot)
             assert con_rot.size(1) == 6
-        trans = trans.reshape(1, -1)
+        trans = trans.reshape(1, -1) # trans를 MLP 입력 형태로 변환
 
+        # MLP를 이용해 latent space로 embedding
         rot_para = self.rot_mlp(con_rot)
         trans_para = self.trans_mlp(trans)
-        rot_mat = self.fill_tensor(rot_para)
-        instances['ref_pts'], mask = self.transform_pts(instances['ref_pts'], calib_inf2veh)
+        rot_mat = self.fill_tensor(rot_para) # 4096을 256*256 rotation matrix로 생성
+        instances['ref_pts'], mask = self.transform_pts(instances['ref_pts'], calib_inf2veh) # reference points는 infra normalization을 vehicle 좌표계로 변환 후 vehicle normalization
+        
+        # mask로 나머지 필드도 필터링, reference points에서 제거된 query는 feature들도 제거
         instances['query_feats'] = instances['query_feats'][mask]
         instances['query_embeds'] = instances['query_embeds'][mask]
         instances['cache_motion_feats'] = instances['cache_motion_feats'][mask]
         instances['pred_boxes'] = instances['pred_boxes'][mask]
 
+        # Residual로 더할 준비
         identity_query_feats = instances['query_feats'].clone()
         identity_query_embeds = instances['query_embeds'].clone()
         identity_cache_motion_feats = instances['cache_motion_feats'].clone()
 
+        # feature 공간에서 trans + rotation 변환 적용 + residual => 좌표계 변환에 맞춰 latent feaute alignment
         instances['query_feats'] = self.feat_output_proj((self.feat_input_proj(instances['query_feats']) @ rot_mat.T + trans_para) + identity_query_feats)
         instances['query_embeds'] = self.embed_output_proj((self.embed_input_proj(instances['query_embeds']) @ rot_mat.T + trans_para) + identity_query_embeds)
         instances['cache_motion_feats'] = self.motion_output_proj((self.motion_input_proj(instances['cache_motion_feats']) @ rot_mat.T + trans_para) + identity_cache_motion_feats)

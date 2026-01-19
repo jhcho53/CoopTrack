@@ -453,6 +453,7 @@ class CoopTrack(MVXTwoStageDetector):
         device = inf_dict['ref_pts'].device
         
         """Detection queries"""
+        # Infra detetion 결과를 track instance 기본 필드로 옮김
         # reference points, query embeds, and query targets (features)
         track_instances.ref_pts = inf_dict['ref_pts'].clone()
         track_instances.query_embeds = inf_dict['query_embeds'].clone()
@@ -460,6 +461,7 @@ class CoopTrack(MVXTwoStageDetector):
         track_instances.cache_motion_feats = inf_dict['cache_motion_feats'].clone()
         track_instances.pred_boxes = inf_dict['pred_boxes'].clone()
         """Tracking information"""
+        # track instance 초기화
         # id for the tracks
         track_instances.obj_idxes = torch.full(
             (len(track_instances),), -1, dtype=torch.long, device=device)
@@ -496,6 +498,10 @@ class CoopTrack(MVXTwoStageDetector):
         #     (len(track_instances), self.pts_bbox_head.code_size), dtype=torch.float, device=device)
         track_instances.cache_scores = torch.zeros(
             (len(track_instances),), dtype=torch.float, device=device)
+        """
+        현재 프레임 cache는 infra dict 입력을 그대로 사용
+        cache는 reasoning이 업데이트 할 대상이기 때문에 원본과 분리해서 유지
+        """
         track_instances.cache_ref_pts = inf_dict['ref_pts'].clone()
         track_instances.cache_query_embeds = inf_dict['query_embeds'].clone()
         track_instances.cache_query_feats = inf_dict['query_feats'].clone()
@@ -555,19 +561,27 @@ class CoopTrack(MVXTwoStageDetector):
         track_instances.cache_ref_pts = track_instances.ref_pts.clone()
         track_instances.cache_query_embeds = track_instances.query_embeds.clone()
         
+        # [:,1:] => [N, hist_len-1] => True, 뒤에 0(False) 한칸 붙임 => 마지막 time stpe만 valid
         track_instances.hist_padding_masks = torch.cat((
             track_instances.hist_padding_masks[:, 1:], 
             torch.zeros((len(track_instances), 1), dtype=torch.bool, device=device)), 
             dim=1)
+        
+        # hist_embeds는 전부 0이었음, 마지막에 현재 cache query feature를 붙임
         track_instances.hist_embeds = torch.cat((
             track_instances.hist_embeds[:, 1:, :], track_instances.cache_query_feats[:, None, :]), dim=1)
+        
+        # 현재 ref_pts를 history 마지막에 저장
         track_instances.hist_xyz = torch.cat((
             track_instances.hist_xyz[:, 1:, :], track_instances.cache_ref_pts[:, None, :]), dim=1)
-        # positional embeds
+        
+        # positional embeds도 마지막 칸에 추가
         track_instances.hist_position_embeds = torch.cat((
             track_instances.hist_position_embeds[:, 1:, :], track_instances.cache_query_embeds[:, None, :]), dim=1)
         track_instances.hist_motion_embeds = torch.cat((
             track_instances.hist_motion_embeds[:, 1:, :], track_instances.cache_motion_feats[:, None, :]), dim=1)
+        
+        # hist buffer 마지막 칸을 현재 프레임으로 채워서 바로 history transformation에 넣을 수 있게 세팅
         return track_instances
 
     def _copy_tracks_for_loss(self, tgt_instances):
