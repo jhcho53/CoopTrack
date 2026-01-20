@@ -78,49 +78,272 @@ class LatentTransformation(nn.Module):
         return ret
 
     def fill_tensor(self, original_tensor):
+        """
+        [Block-Diagonal Matrix 생성 함수]
+        ------------------------------------------------------------
+        목적:
+        - original_tensor에 들어있는 값을 이용해서 (d x d) 행렬을 만든다.
+        - 단, 전체를 채우는 게 아니라 "head별로 분리된 block" 형태로 채운다.
+            즉, Multi-Head Attention 처럼
+            head0: [k x k]
+            head1: [k x k]
+            ...
+            head(h-1): [k x k]
+            이런 블록들이 대각선에 배치된 block-diagonal 행렬을 만든다.
+
+        예시:
+        embed_dims = d = 256
+        head = h = 16
+        그러면 head당 차원 k = d / h = 16
+
+        최종 행렬은 [256 x 256]이고,
+        대각선에 16개의 [16 x 16] 블록이 들어감.
+        """
+
+        # head 개수 (예: 16)
         h = self.head
+
+        # head당 embedding 차원 (예: 256//16 = 16)
         k = self.embed_dims // self.head
+
+        # 전체 embedding 차원 = 최종 행렬 크기 (예: 256)
         d = self.embed_dims
+
+        # ------------------------------------------------------------
+        # 1) 각 head 블록이 시작하는 "행/열 시작 index" 만들기
+        # ------------------------------------------------------------
+        """
+        blocks_indices: [h] 크기의 텐서
+        head 0 블록 시작 index = 0*k
+        head 1 블록 시작 index = 1*k
+        head 2 블록 시작 index = 2*k
+        ...
+        head (h-1) 블록 시작 index = (h-1)*k
         
+        예: k=16이면
+        blocks_indices = [0, 16, 32, 48, ..., 240]
+        """
         blocks_indices = torch.arange(h, device=original_tensor.device) * k
+
+        # ------------------------------------------------------------
+        # 2) 블록 내부에서 사용할 offset 좌표 생성 (0~k-1)
+        # ------------------------------------------------------------
+        """
+        offset: [k]
+        0, 1, 2, ..., k-1
         
+        블록 크기가 kxk니까
+        row offset / col offset을 만들기 위해 사용
+        """
         offset = torch.arange(k, device=original_tensor.device)
+
+        """
+        rows_offset, cols_offset: 각각 [k, k]
+        - torch.meshgrid(offset, offset)은
+        (i,j) 격자 인덱스를 만들어줘서
+        kxk 좌표 전체를 구성할 수 있음
+
+        예: k=3이면
+        rows_offset =
+            [[0,0,0],
+            [1,1,1],
+            [2,2,2]]
+        cols_offset =
+            [[0,1,2],
+            [0,1,2],
+            [0,1,2]]
+        """
         rows_offset, cols_offset = torch.meshgrid(offset, offset)
-        
+
+        # ------------------------------------------------------------
+        # 3) head별로 블록의 "전체 행/열 좌표" 만들기
+        # ------------------------------------------------------------
+        """
+        base_rows: [h,1,1]
+        - 각 head의 시작 row index를 (브로드캐스트 가능하게) reshape한 것
+
+        예: blocks_indices가 [0,16,32,...]라면
+        base_rows =
+            [[[0]],
+            [[16]],
+            [[32]],
+            ...
+            ]
+        """
         base_rows = blocks_indices.view(h, 1, 1)
+
+        """
+        global_rows: [h, k, k]
+        - 각 head 블록에 대해,
+        row index를 "전체 행렬 좌표계"로 확장한 것
+
+        head t에 대해:
+        global_rows[t] = base_rows[t] + rows_offset
+
+        즉, head별 블록이 들어갈 row 좌표들.
+        """
         global_rows = base_rows + rows_offset.unsqueeze(0)
+
+        """
+        base_cols도 row와 동일한 방식으로
+        각 head의 시작 col index를 만들고,
+        global_cols는 전체 col 좌표를 head별로 생성한다.
+        """
         base_cols = blocks_indices.view(h, 1, 1)
         global_cols = base_cols + cols_offset.unsqueeze(0)
-        
+
+        # ------------------------------------------------------------
+        # 4) head별 block 좌표들을 1차원 index 리스트로 펼치기
+        # ------------------------------------------------------------
+        """
+        all_rows: [h*k*k]
+        all_cols: [h*k*k]
+        - (head, block_row, block_col)을 하나의 리스트로 flatten한 형태
+        - 이 (all_rows[n], all_cols[n]) 위치에 data[n] 값을 넣을 예정
+        """
         all_rows = global_rows.reshape(-1)
         all_cols = global_cols.reshape(-1)
+
+        # ------------------------------------------------------------
+        # 5) original_tensor를 flatten해서 data로 사용
+        # ------------------------------------------------------------
+        """
+        original_tensor는 보통 [h*k*k] 또는 [h, k, k] 형태의 값이 들어있다고 가정
+        예: rot_mlp 출력이 rot_final_dim = h*k*k = 4096
+
+        data: [h*k*k]
+        - 이 값들이 head별 kxk 블록에 순서대로 들어가게 됨
+        """
         data = original_tensor.view(-1)
-        
+
+        # ------------------------------------------------------------
+        # 6) 최종 (d x d) 행렬을 만들고 block-diagonal 위치에 값 채우기
+        # ------------------------------------------------------------
+        """
+        target_tensor: [d, d]
+        - 전체는 0으로 초기화
+        - 이후 block-diagonal 위치에만 data 값이 들어감
+        """
         target_tensor = torch.zeros((d, d), device=original_tensor.device)
+
+        """
+        핵심!
         target_tensor[all_rows, all_cols] = data
-        
+
+        즉,
+        head0 블록 영역 (0~k-1, 0~k-1)에 data 일부가 채워지고
+        head1 블록 영역 (k~2k-1, k~2k-1)에 data 다음 일부가 채워지고
+        ...
+        나머지 영역은 전부 0 (블록 밖은 연결 없음)
+        """
+        target_tensor[all_rows, all_cols] = data
+
+        # block-diagonal matrix 반환
         return target_tensor
 
     def transform_pts(self, points, transformation):
-        # relative -> absolute (in inf pc range)
-        locs = points.clone()
-        locs[:, 0:1] = (locs[:, 0:1] * (self.inf_pc_range[3] - self.inf_pc_range[0]) + self.inf_pc_range[0])
-        locs[:, 1:2] = (locs[:, 1:2] * (self.inf_pc_range[4] - self.inf_pc_range[1]) + self.inf_pc_range[1])
-        locs[:, 2:3] = (locs[:, 2:3] * (self.inf_pc_range[5] - self.inf_pc_range[2]) + self.inf_pc_range[2])
+        """
+        [transform_pts]
+        -------------------------------------------------------------
+        목적:
+        - 인프라(infra) 관측 결과의 reference point(points)를
+            차량(vehicle) 좌표계 기준 reference point로 변환하는 함수
 
-        # transformation
+        입력:
+        points : [N, 3]
+            - infra pc_range 기준으로 normalize된 좌표 (0~1 범위)
+            - 각 row는 하나의 query reference point
+            - points[:, 0] = x (normalized)
+            - points[:, 1] = y (normalized)
+            - points[:, 2] = z (normalized)
+
+        transformation : [4, 4]
+            - inf → veh 좌표계 변환 행렬 (homogeneous transform)
+            - 즉, infra world 좌표를 vehicle world 좌표로 변환하는 행렬
+
+        출력:
+        locs : [M, 3]
+            - vehicle pc_range 기준으로 normalize된 좌표 (0~1 범위)
+            - 단, pc_range 밖은 제거되므로 M ≤ N
+
+        mask : [N]
+            - True인 query만 살아남음 (vehicle 범위 내부)
+            - 이후 query_feats/query_embeds/pred_boxes 등을 동일하게 필터링할 때 사용
+        """
+
+        # =========================================================
+        # 1) infra normalized 좌표 → infra world(절대좌표)로 복원(denormalize)
+        # =========================================================
+        # points는 [0~1] 스케일이므로 실제 공간 단위(meter 등)로 복원해야
+        # 4x4 rigid transformation(회전/이동)을 적용할 수 있음
+        locs = points.clone()
+
+        # x 복원:
+        #   x_abs = x_norm * (x_max - x_min) + x_min
+        # index 설명:
+        #   locs[:, 0:1] => [N, 1] 형태 유지 (broadcast 안정적)
+        locs[:, 0:1] = (
+            locs[:, 0:1] * (self.inf_pc_range[3] - self.inf_pc_range[0]) + self.inf_pc_range[0]
+        )
+
+        # y 복원
+        locs[:, 1:2] = (
+            locs[:, 1:2] * (self.inf_pc_range[4] - self.inf_pc_range[1]) + self.inf_pc_range[1]
+        )
+
+        # z 복원
+        locs[:, 2:3] = (
+            locs[:, 2:3] * (self.inf_pc_range[5] - self.inf_pc_range[2]) + self.inf_pc_range[2]
+        )
+
+        # =========================================================
+        # 2) 4x4 homogeneous transformation 적용 (inf world → veh world)
+        # =========================================================
+        # 4x4 변환행렬을 적용하려면 [x, y, z]를 [x, y, z, 1]로 확장해야 함
+        # torch.ones_like(locs[..., :1]) => [N, 1] shape의 1벡터 생성
+        # torch.cat(...) => [N, 4] (homogeneous coordinate)
+        # unsqueeze(-1) => [N, 4, 1] (행렬곱을 위해 column vector로 변경)
         locs = torch.cat((locs, torch.ones_like(locs[..., :1])), -1).unsqueeze(-1)
-        locs = torch.matmul(transformation, locs).squeeze(-1)[..., :3]
-        
-        # filter
-        mask = (self.pc_range[0] <= locs[:, 0]) & (locs[:, 0] <= self.pc_range[3]) & \
-                    (self.pc_range[1] <= locs[:, 1]) & (locs[:, 1] <= self.pc_range[4])
+
+        # transformation: [4,4], locs: [N,4,1]
+        # 결과: [N,4,1] (각 point에 동일한 rigid transform 적용)
+        locs = torch.matmul(transformation, locs)
+
+        # squeeze(-1) => [N,4]
+        # [..., :3]  => [N,3] (x,y,z만 사용하고 homogeneous w는 버림)
+        locs = locs.squeeze(-1)[..., :3]
+
+        # =========================================================
+        # 3) vehicle pc_range 밖의 point 제거 (filtering)
+        # =========================================================
+        # 이유:
+        #   infra에서 본 객체가 vehicle의 관심영역(pc_range)에 없을 수 있음
+        #   vehicle 범위 밖 query는 이후 fusion/association에서 방해가 되므로 제거
+        #
+        # 여기서는 x,y에 대해서만 범위 체크함
+        # (보통 BEV 기반이므로 xy만 컷해도 충분한 경우가 많음)
+        mask = (
+            (self.pc_range[0] <= locs[:, 0]) & (locs[:, 0] <= self.pc_range[3]) &
+            (self.pc_range[1] <= locs[:, 1]) & (locs[:, 1] <= self.pc_range[4])
+        )
+
+        # mask가 True인 point만 유지
+        # locs shape이 [N,3] → [M,3] 로 줄어듦
         locs = locs[mask]
-        # absolute -> relative (in veh pc range)
+
+        # =========================================================
+        # 4) vehicle world 좌표 → vehicle normalized 좌표로 변환(normalize)
+        # =========================================================
+        # 이후 vehicle model 내부에서는 ref_pts를 normalize된 형태(0~1)로 쓰는 경우가 많음
+        # 따라서 vehicle pc_range 기준으로 다시 normalize 해서 반환
+        #
+        # x_norm = (x_abs - x_min) / (x_max - x_min)
         locs[..., 0:1] = (locs[..., 0:1] - self.pc_range[0]) / (self.pc_range[3] - self.pc_range[0])
         locs[..., 1:2] = (locs[..., 1:2] - self.pc_range[1]) / (self.pc_range[4] - self.pc_range[1])
         locs[..., 2:3] = (locs[..., 2:3] - self.pc_range[2]) / (self.pc_range[5] - self.pc_range[2])
 
+        # locs : [M,3] (veh normalized ref_pts)
+        # mask : [N]  (살아남은 query 표시)
         return locs, mask
     
     def transform_boxes(self, pred_boxes, transformation):

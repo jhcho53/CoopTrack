@@ -666,46 +666,173 @@ class CoopTrack(MVXTwoStageDetector):
         return track_instances
     
     def frame_summarization(self, track_instances, tracking=False):
-        """ Load the results after spatial-temporal reasoning into track instances
         """
-        # inference mode
+        [frame_summarization]
+        -------------------------------------------------------------
+        목적:
+        - SpatialTemporalReasoner(STReasoner) 이후, cache_*에 저장된 "현재 프레임의 최신 결과"를
+            track_instances의 메인 필드(pred_*, ref_pts, query_feats 등)로 복사/갱신한다.
+        - 즉, "현재 프레임에서 확정된 상태"를 track_instances에 반영해서
+            다음 프레임에서 reference point update / tracking을 계속할 수 있도록 만드는 단계.
+
+        입력:
+        track_instances : Instances 객체 (num_query 개수만큼 query 상태를 담고 있음)
+        tracking=False  : True면 inference/track 모드, False면 training 모드
+
+        주요 사용되는 필드 의미:
+        - cache_* : 이번 프레임에서 detection + STReasoner가 만든 임시 결과 (현재 프레임 최신)
+            cache_logits      : [N, num_cls] class logits (raw)
+            cache_scores      : [N] objectness/score (sigmoid(max(logits)))
+            cache_bboxes      : [N, box_dim] bbox 예측 (보통 denormalize 상태)
+            cache_ref_pts     : [N, 3] 다음 layer/프레임에서 쓰는 reference point (normalize)
+            cache_query_feats : [N, C] query hidden state feature
+            cache_query_embeds: [N, C] positional embedding (ref_pts 기반)
+            cache_motion_predictions: [N, fut_len, 3] 미래 motion delta 예측
+
+        - pred_* : track_instances가 공식적으로 들고 있는 "현재 frame 결과"
+            pred_logits : [N, num_cls]
+            scores      : [N]
+            pred_boxes  : [N, box_dim]
+
+        - ref_pts / query_feats / query_embeds :
+            다음 프레임 tracking에서 그대로 재사용되는 핵심 상태
+        """
+
+        # =========================================================
+        # 1) active_mask 정의: "어떤 query를 살려서 업데이트할지" 결정
+        # =========================================================
+
+        # [Inference / Tracking 모드]
         if tracking:
+            """
+            inference에서는 모든 query를 업데이트하지 않고,
+            점수가 충분히 높은 query만 "track 상태로 기록/유지"한다.
+
+            record_threshold 이상인 query만 active로 취급
+            - runtime_tracker.record_threshold는 보통 0.4 같은 값
+            - 낮은 점수 query는 노이즈로 보고 업데이트하지 않을 수 있음
+            """
             active_mask = (track_instances.cache_scores >= self.runtime_tracker.record_threshold)
+
+            # debug용 출력 가능
             # print(f"update instance: {track_instances.obj_idxes[active_mask]}")
-            # active_mask = (track_instances.cache_scores >= 0.0)
-        # training mode
+
+        # [Training 모드]
         else:
-            track_instances.pred_boxes = track_instances.cache_bboxes.clone()
+            """
+            training에서는 모든 query를 업데이트 대상으로 두는 편.
+            이유:
+            - loss 계산 및 학습 안정성을 위해 일단 전부 업데이트하고
+            - 이후에 get_active_mask(matched_gt_idxes + IoU) 같은 로직에서 진짜 active만 선택함.
+            """
+            track_instances.pred_boxes = track_instances.cache_bboxes.clone()   # cache 결과를 pred로 복사
             track_instances.pred_logits = track_instances.cache_logits.clone()
             track_instances.scores = track_instances.cache_scores.clone()
+
+            # training에서는 보통 전체 query 다 업데이트하도록 >= 0.0 사용
             active_mask = (track_instances.cache_scores >= 0.0)
 
+        # =========================================================
+        # 2) cache 결과를 pred / 상태 필드로 반영 (active query만)
+        # =========================================================
+
+        # (1) classification logits 갱신
         track_instances.pred_logits[active_mask] = track_instances.cache_logits[active_mask]
+
+        # (2) score 갱신
         track_instances.scores[active_mask] = track_instances.cache_scores[active_mask]
+
+        # (3) bbox prediction 갱신
         track_instances.pred_boxes[active_mask] = track_instances.cache_bboxes[active_mask]
+
+        # (4) reference point 갱신
+        """
+        ref_pts는 다음 프레임에서 tracking query의 "초기 위치(anchor)" 역할을 한다.
+        cache_ref_pts는 이번 프레임 reasoning/box refine 이후 최신 ref point이므로
+        active query만 업데이트해서 ref_pts에 반영한다.
+        """
         ref_pts = track_instances.ref_pts.clone()
         ref_pts[active_mask] = track_instances.cache_ref_pts[active_mask]
         track_instances.ref_pts = ref_pts
+
+        # (5) positional embedding(query_embeds) 갱신
+        """
+        query_embeds는 ref_pts로부터 생성된 positional embedding이므로
+        ref_pts가 바뀌면 query_embeds도 함께 최신 값으로 바꿔야 한다.
+        """
         query_embeds = track_instances.query_embeds.clone()
         query_embeds[active_mask] = track_instances.cache_query_embeds[active_mask]
         track_instances.query_embeds = query_embeds
+
+        # (6) query feature(query_feats) 갱신
+        """
+        query_feats는 Transformer decoder가 만든 hidden state이고,
+        다음 프레임 temporal reasoning / tracking에 직접 쓰이는 핵심 feature다.
+        """
         query_feats = track_instances.query_feats.clone()
         query_feats[active_mask] = track_instances.cache_query_feats[active_mask]
         track_instances.query_feats = query_feats
+
+        # (7) motion prediction 갱신
+        """
+        cache_motion_predictions는 STReasoner의 future reasoning/motion head 등이 만든 결과.
+        active query만 최신 motion prediction으로 교체.
+        """
         track_instances.motion_predictions[active_mask] = track_instances.cache_motion_predictions[active_mask]
 
+        # =========================================================
+        # 3) Future Reasoning이 켜져 있다면, fut_xyz / fut_bboxes 업데이트
+        # =========================================================
         if self.STReasoner.future_reasoning:
+            """
+            motion_predictions: [N_active, fut_len, 3]
+            - 보통 (dx, dy, dz) 형태의 step-wise motion delta
+            - 여기서는 x,y만 누적해서 미래 위치를 만듦
+
+            fut_xyz/fut_bboxes는:
+            - 다음 프레임 reference point update에서 쓰이거나
+            - forecasting loss 계산에서 쓰이거나
+            - planning 모듈에서 trajectory로 쓰일 수 있음
+            """
+
+            # active query들에 대해서만 motion prediction을 가져옴
             motion_predictions = track_instances.motion_predictions[active_mask]
-            track_instances.fut_xyz[active_mask] = track_instances.ref_pts[active_mask].clone()[:, None, :].repeat(1, self.fut_len, 1)
-            track_instances.fut_bboxes[active_mask] = track_instances.pred_boxes[active_mask].clone()[:, None, :].repeat(1, self.fut_len, 1)
-            motion_add = torch.cumsum(motion_predictions.clone().detach(), dim=1)
+
+            # (1) fut_xyz 초기화: 현재 ref_pts를 fut_len 만큼 복사해서 시작점으로 만든다
+            #     shape: [N_active, fut_len, 3]
+            track_instances.fut_xyz[active_mask] = (
+                track_instances.ref_pts[active_mask].clone()[:, None, :]
+                .repeat(1, self.fut_len, 1)
+            )
+
+            # (2) fut_bboxes 초기화: 현재 pred_boxes를 fut_len 만큼 복사
+            #     shape: [N_active, fut_len, box_dim]
+            track_instances.fut_bboxes[active_mask] = (
+                track_instances.pred_boxes[active_mask].clone()[:, None, :]
+                .repeat(1, self.fut_len, 1)
+            )
+
+            # (3) motion delta를 time axis로 누적합해서 "미래까지의 총 이동량"으로 변환
+            #     예: [dx1, dx2, dx3] -> [dx1, dx1+dx2, dx1+dx2+dx3]
+            # detach 이유: 미래 예측을 다음 상태 업데이트에 쓰더라도 gradient 경로를 끊어 안정화
+            motion_add = torch.cumsum(motion_predictions.clone().detach(), dim=1)  # [N_active, fut_len, 3]
+
+            # (4) fut_xyz는 normalized 좌표 기반이므로,
+            #     world delta(motion_add)를 normalized delta로 바꿔서 더해줘야 함
             motion_add_normalized = motion_add.clone()
-            motion_add_normalized[..., 0] /= (self.pc_range[3] - self.pc_range[0])
-            motion_add_normalized[..., 1] /= (self.pc_range[4] - self.pc_range[1])
+            motion_add_normalized[..., 0] /= (self.pc_range[3] - self.pc_range[0])  # x range로 정규화
+            motion_add_normalized[..., 1] /= (self.pc_range[4] - self.pc_range[1])  # y range로 정규화
+
+            # (5) normalized future ref point 업데이트 (x,y만)
             track_instances.fut_xyz[active_mask, :, 0] += motion_add_normalized[..., 0]
             track_instances.fut_xyz[active_mask, :, 1] += motion_add_normalized[..., 1]
-            track_instances.fut_bboxes[active_mask, :, 0] += motion_add[..., 0]
-            track_instances.fut_bboxes[active_mask, :, 1] += motion_add[..., 1]
+
+            # (6) fut_bboxes는 world 좌표(box center)로 저장되는 경우가 많아서
+            #     motion_add(world delta)를 그대로 더해줌
+            track_instances.fut_bboxes[active_mask, :, 0] += motion_add[..., 0]  # cx
+            track_instances.fut_bboxes[active_mask, :, 1] += motion_add[..., 1]  # cy
+
+        # 최종적으로 업데이트된 track_instances 반환
         return track_instances
     
     def loss_single_batch(self, gt_bboxes_3d, gt_labels_3d, gt_inds, pred_dict):
@@ -1231,73 +1358,201 @@ class CoopTrack(MVXTwoStageDetector):
                                     timestamp,
                                     veh2inf_rt,
                                     **kwargs):
-        """Forward funciton
-        Args:
-        Returns:
         """
+        [Streaming Track Train Forward]
+        - seq_mode(스트리밍 학습)에서 한 step(현재 frame)만 forward 하는 함수
+        - 이전 프레임의 상태(train_prev_infos)를 이용해서
+        시간 차(time_delta), ego pose 변화량(can_bus), 이전 BEV(prev_bev), 이전 track_instances를 세팅하고
+        _forward_single_frame_train_bs()로 현재 프레임 학습을 수행한 뒤
+        다시 train_prev_infos를 업데이트해서 다음 프레임으로 전달한다.
+
+        입력 텐서/자료 구조 핵심:
+        ---------------------------------------------------------
+        img: shape 보통 [B, num_frame(=1), num_cam, C, H, W] 형태로 들어오는 경우가 많음
+            => 코드에서 img_[0]을 뽑는 걸 보면 num_frame 축이 존재함
+        img_metas: [B][num_frame] 구조의 list of dict
+            예) img_metas[i][0] : i번째 batch의 현재 프레임 메타
+        timestamp: [B][num_frame] 구조
+            예) timestamp[i][0] : i번째 batch의 현재 프레임 시간
+
+        l2g_r_mat, l2g_t: 로컬->글로벌 좌표 변환 (ego pose)
+            l2g_r_mat[i][0], l2g_t[i][0]이 "현재 frame pose"
+        """
+
+        # 배치 크기 검증: 설정한 batch_size와 입력 img의 batch 차원이 일치해야 함
         assert self.batch_size == img.size(0)
-        # import ipdb;ipdb.set_trace()
+
+        # 각 batch마다 time delta / 이전-현재 ego 변환 정보를 저장할 리스트 초기화
         time_delta = [None] * self.batch_size
-        l2g_r1 = [None] * self.batch_size
-        l2g_t1 = [None] * self.batch_size
-        l2g_r2 = [None] * self.batch_size
-        l2g_t2 = [None] * self.batch_size
+        l2g_r1 = [None] * self.batch_size   # 이전 frame rotation
+        l2g_t1 = [None] * self.batch_size   # 이전 frame translation
+        l2g_r2 = [None] * self.batch_size   # 현재 frame rotation
+        l2g_t2 = [None] * self.batch_size   # 현재 frame translation
+
+        # ============================================================
+        # 1) batch별로 "이전 프레임 정보"를 기반으로 현재 프레임 입력을 보정
+        # ============================================================
         for i in range(self.batch_size):
+
+            # tmp_pos, tmp_angle은 "현재 can_bus 원본값"을 저장해둔다 (나중에 prev_infos 업데이트용)
+            # img_metas[i][0]['can_bus'] 구조는 보통:
+            #   can_bus[:3]  -> ego position (x,y,z) 또는 (x,y,?)  
+            #   can_bus[-1]  -> ego yaw angle (heading)
             tmp_pos = copy.deepcopy(img_metas[i][0]['can_bus'][:3])
             tmp_angle = copy.deepcopy(img_metas[i][0]['can_bus'][-1])
+
+            # ------------------------------------------------------------
+            # [Scene reset 조건]
+            # 1) scene_token이 바뀐 경우 : 새로운 장면 시작
+            # 2) timestamp gap이 너무 큰 경우(>0.5s) : 중간 프레임이 끊겼다고 판단
+            # 3) timestamp가 감소한 경우 : 시계열이 뒤틀림(데이터 순서 문제)
+            # => 이 경우는 "이전 프레임과 연속성이 없다"고 보고
+            #    tracking memory를 초기화한다.
+            # ------------------------------------------------------------
             if img_metas[i][0]['scene_token'] != self.train_prev_infos['scene_token'][i] or \
                 timestamp[i][0] - self.train_prev_infos['prev_timestamp'][i] > 0.5 or \
                 timestamp[i][0] < self.train_prev_infos['prev_timestamp'][i]:
-                # the first sample of each scene is truncated
+
+                # 첫 샘플이거나 시계열이 끊겼으므로, 이전 track / prev_bev는 무효
                 self.train_prev_infos['track_instances'][i] = None
                 self.train_prev_infos['prev_bev'][i] = None
+
+                # 이번 프레임은 "이전 프레임 기반 보정"을 할 수 없으므로 None
                 time_delta[i], l2g_r1[i], l2g_t1[i], l2g_r2[i], l2g_t2[i] = None, None, None, None, None
+
+                # can_bus를 0으로 만들어서 "이 프레임은 ego motion이 없다"고 처리
+                # (BEVFormer류 temporal alignment에서 첫 프레임 처리를 동일하게 맞추려는 목적)
                 img_metas[i][0]['can_bus'][:3] = 0
                 img_metas[i][0]['can_bus'][-1] = 0
+
             else:
+                # ------------------------------------------------------------
+                # [연속 프레임이라면]
+                # 1) time_delta 계산 (현재 - 이전)
+                # 2) 이전 ego pose(l2g_r1,t1), 현재 ego pose(l2g_r2,t2) 준비
+                # 3) can_bus를 "차분(delta)" 형태로 바꾼다
+                #    => 현재 pose - 이전 pose (relative motion)
+                # ------------------------------------------------------------
+
+                # time_delta[i] = 현재프레임 timestamp - 이전프레임 timestamp
                 time_delta[i] = timestamp[i][0] - self.train_prev_infos['prev_timestamp'][i]
                 assert time_delta[i] > 0
+
+                # 이전 frame의 pose
                 l2g_r1[i] = self.train_prev_infos['l2g_r_mat'][i]
                 l2g_t1[i] = self.train_prev_infos['l2g_t'][i]
+
+                # 현재 frame의 pose (입력으로 들어온 l2g_r_mat/l2g_t에서 추출)
+                # l2g_r_mat[i][0] : i번째 batch의 현재 frame rotation
+                # l2g_t[i][0]     : i번째 batch의 현재 frame translation
                 l2g_r2[i] = l2g_r_mat[i][0]
                 l2g_t2[i] = l2g_t[i][0]
+
+                # can_bus를 절대 위치가 아닌 "변화량"으로 만든다.
+                # 즉, 현재 position - 이전 position
                 img_metas[i][0]['can_bus'][:3] -= self.train_prev_infos['prev_pos'][i]
                 img_metas[i][0]['can_bus'][-1] -= self.train_prev_infos['prev_angle'][i]
-            
-            # update prev_infos
-            # timestamp[0][0]: the first 0 is batch, the second 0 is num_frame
+
+            # ============================================================
+            # 2) prev_infos 업데이트 (다음 프레임을 위해 현재 프레임을 저장)
+            # ============================================================
+
+            # scene_token 저장 (scene 경계 판별용)
             self.train_prev_infos['scene_token'][i] = img_metas[i][0]['scene_token']
+
+            # 현재 timestamp 저장 (다음 step에서 time_delta 계산용)
             self.train_prev_infos['prev_timestamp'][i] = timestamp[i][0]
+
+            # 현재 pose 저장 (다음 step에서 l2g_r1/t1로 사용됨)
             self.train_prev_infos['l2g_r_mat'][i] = l2g_r_mat[i][0]
             self.train_prev_infos['l2g_t'][i] = l2g_t[i][0]
+
+            # "현재 can_bus 원본 절대값"을 저장 (다음 step에서 delta 계산 기준이 됨)
             self.train_prev_infos['prev_pos'][i] = tmp_pos
             self.train_prev_infos['prev_angle'][i] = tmp_angle
 
-        prev_bev = torch.stack([bev if isinstance(bev, torch.Tensor) 
-                                    else torch.zeros([self.pts_bbox_head.bev_h*self.pts_bbox_head.bev_w, self.pts_bbox_head.in_channels]).to(img.device)
-                                    for bev in self.train_prev_infos['prev_bev']])
+        # ============================================================
+        # 3) prev_bev 구성
+        # ============================================================
+        """
+        self.train_prev_infos['prev_bev']는 batch마다 prev_bev가 저장되어 있음
+        - 첫 프레임에서는 None일 수 있으므로
+        None이면 "0 BEV feature"로 채운다.
+
+        최종 prev_bev shape:
+        [B, bev_h*bev_w, C] 형태로 stacking됨
+        (아래 torch.zeros도 그 shape에 맞춰 만듦)
+        """
+        prev_bev = torch.stack([
+            bev if isinstance(bev, torch.Tensor)
+            else torch.zeros(
+                [self.pts_bbox_head.bev_h * self.pts_bbox_head.bev_w,
+                self.pts_bbox_head.in_channels]
+            ).to(img.device)
+            for bev in self.train_prev_infos['prev_bev']
+        ])
+
+        # ============================================================
+        # 4) 이전 track_instances 가져오기
+        # ============================================================
+        """
+        train_det=True면 "detection만 학습"하거나 tracking memory를 사용하지 않는 모드라서
+        track_instances를 전부 None으로 초기화한다.
+
+        train_det=False면 streaming tracking 학습이므로
+        이전 프레임에서 저장해둔 track_instances를 불러와서 이어서 사용한다.
+        """
         if self.train_det:
             track_instances = [None for i in range(self.batch_size)]
         else:
             track_instances = self.train_prev_infos['track_instances']
 
+        # ============================================================
+        # 5) 현재 frame만 뽑아서 single-frame forward 수행
+        # ============================================================
+        """
+        img는 [B, num_frame, num_cam, C, H, W] 구조일 가능성이 높음
+        그래서 img_[0]으로 "현재 프레임(첫 프레임)"만 가져옴
+
+        img_single shape:
+        [B, num_cam, C, H, W]
+        """
         img_single = torch.stack([img_[0] for img_ in img], dim=0)
+
+        # img_metas도 마찬가지로 현재 frame meta만 뽑음
+        # deepcopy를 쓰는 이유:
+        #   - 앞에서 can_bus를 delta 형태로 바꾸는 등의 수정이 들어갔고
+        #   - downstream에서 meta를 in-place로 만질 수 있으니 안전하게 복사
         img_metas_single = [copy.deepcopy(img_metas[i][0]) for i in range(self.batch_size)]
+
+        # ============================================================
+        # 6) 핵심: 한 프레임 학습 forward 수행
+        # ============================================================
+        """
+        _forward_single_frame_train_bs()는 실제로
+        - BEV 생성(get_bevs)
+        - detection head(Transformer decoder)
+        - loss 계산(loss_single_batch, history/future reasoning 등)
+        - 다음 프레임용 track_instances 준비(frame_summarization + active_mask)
+        을 수행하고
+
+        반환:
+        frame_res: dict
+            - frame_res["track_instances"] : 다음 프레임으로 넘길 active track_instances (batch list)
+            - frame_res["bev_embed"]       : 현재 프레임 BEV embedding
+        losses: dict
+        """
         frame_res, losses = self._forward_single_frame_train_bs(
             img_single,
             img_metas_single,
             track_instances,
-            None, # prev_img
-            None, # prev_img_metas
+            None,  # prev_img (stream 모드에서는 prev_img 직접 안 쓰고 prev_bev만 사용)
+            None,  # prev_img_metas
             l2g_r1,
             l2g_t1,
             l2g_r2,
             l2g_t2,
             time_delta,
-            # all_query_embeddings,
-            # all_matched_idxes,
-            # all_instances_pred_logits,
-            # all_instances_pred_boxes,
             veh2inf_rt,
             prev_bev=prev_bev,
             gt_bboxes_3d=gt_bboxes_3d,
@@ -1307,12 +1562,34 @@ class CoopTrack(MVXTwoStageDetector):
             gt_forecasting_masks=gt_forecasting_masks,
             **kwargs,
         )
+
+        # 다음 프레임용 track_instances (batch list 형태)
         track_instances = frame_res["track_instances"]
 
+        # ============================================================
+        # 7) train_prev_infos 업데이트 (다음 프레임으로 streaming memory 전달)
+        # ============================================================
+        """
+        frame_res['bev_embed']는 현재 frame의 BEV embedding인데,
+        다음 프레임을 위해 train_prev_infos['prev_bev']에 저장해야 한다.
+
+        detach().clone() 하는 이유:
+        - prev_bev는 "다음 프레임에서 입력으로 쓸 메모리"이지
+            gradient를 계속 연결하면 BPTT처럼 그래프가 길게 이어져서 메모리 터짐
+        - 따라서 여기서 gradient 연결을 끊는다(detach)
+        """
         bev_embed = frame_res['bev_embed'].detach().clone()
+
         for i in range(self.batch_size):
+            # bev_embed[:, i, :] : i번째 batch의 BEV embedding
+            # shape: [bev_h*bev_w, C]
             self.train_prev_infos['prev_bev'][i] = bev_embed[:, i, :]
+
+            # track_instances[i]도 다음 프레임 입력으로 쓰기 때문에
+            # detach_and_clone()으로 그래프를 끊고 저장
             self.train_prev_infos['track_instances'][i] = track_instances[i].detach_and_clone()
+
+        # 최종적으로 현재 프레임의 loss들을 반환
         return losses
 
     def _forward_single_frame_inference(

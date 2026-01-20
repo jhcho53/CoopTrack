@@ -763,81 +763,304 @@ class SpatialTemporalReasoner(nn.Module):
         return locs
     
     def _learn_matching(self, inf, veh, inf_pts, veh_pts, mask):
-        # filter veh
+        """
+        [학습 기반 Vehicle ↔ Infra Query Matching 함수]
+        ------------------------------------------------------------
+        목적:
+        - 차량(veh) query들과 인프라(inf) query들을 1:1로 매칭(association)하기 위해
+            "학습 가능한 attention score"를 만들고,
+            inference에서는 Hungarian assignment로 최종 매칭 index를 반환한다.
+
+        입력:
+        inf, veh : Instances 형태의 track query 집합
+            - cache_query_feats : [N, C] query embedding
+            - cache_motion_feats: [N, C] motion embedding
+            - cache_ref_pts     : [N, 3] reference point (normalized)
+        inf_pts, veh_pts : matching에 쓸 좌표 (여기서는 사용하지 않고 있음)
+        mask : [Nveh] boolean
+            - vehicle query 중 confidence가 높은 것만 남기기 위한 mask
+            - ex) veh.cache_scores > veh_thre
+
+        출력:
+        (veh_idx, inf_idx, attn)
+            - veh_idx : 매칭된 veh query index (veh query 쪽 인덱스)
+            - inf_idx : 매칭된 inf query index (inf query 쪽 인덱스)
+            - attn    : [Nveh, Ninf] attention logit (affinity로 쓰이는 값의 sigmoid 전 단계)
+        """
+
+        # ============================================================
+        # 0) Training일 때: vehicle query 중 "confidence 낮은 애들" 제외
+        # ============================================================
+        """
+        mask는 원래 veh 전체 길이 기준 index를 의미한다.
+        veh = veh[mask]를 하면 veh 인덱스가 줄어들기 때문에,
+        나중에 다시 원래 index로 되돌릴 수 있도록 filter_indices를 저장해둔다.
+
+        예)
+        veh 원래 길이 = 900
+        mask True 개수 = 200
+        -> veh[mask]는 길이 200짜리 새 veh 집합
+        -> filter_indices는 "원래 900 기준 인덱스에서 True였던 위치 목록"
+        """
         if self.training:
-            indices = torch.arange(len(veh))
-            filter_indices = indices[mask]
-            veh = veh[mask]
+            indices = torch.arange(len(veh))        # [Nveh] = [0,1,2,...]
+            filter_indices = indices[mask]          # True인 index만 남김
+            veh = veh[mask]                         # vehicle instance 필터링 (low score 제거)
 
-        inf_query = inf.cache_query_feats.clone()
-        inf_motion = inf.cache_motion_feats.clone()
-        inf_ref_pts = inf.cache_ref_pts.clone()
-        veh_query = veh.cache_query_feats.clone()
-        veh_motion = veh.cache_motion_feats.clone()
-        veh_ref_pts = veh.cache_ref_pts.clone()
-        # 1. construct graph
-        # 1.1 prepare nodes
-        inf_nodes = self.get_node_inf(torch.cat([inf_query, inf_motion], dim=-1))
-        veh_nodes = self.get_node_veh(torch.cat([veh_query, veh_motion], dim=-1))
+        # ============================================================
+        # 1) veh/inf에서 필요한 feature들을 꺼내오기
+        # ============================================================
+        # inf query feature
+        inf_query   = inf.cache_query_feats.clone()     # [Ninf, C]
+        inf_motion  = inf.cache_motion_feats.clone()    # [Ninf, C]
+        inf_ref_pts = inf.cache_ref_pts.clone()         # [Ninf, 3]
 
-        # 1.2 prepare edges
-        dis = veh_ref_pts.unsqueeze(1) - inf_ref_pts
-        edges = self.get_edge(dis)
+        # veh query feature
+        veh_query   = veh.cache_query_feats.clone()     # [Nveh_filtered, C]
+        veh_motion  = veh.cache_motion_feats.clone()    # [Nveh_filtered, C]
+        veh_ref_pts = veh.cache_ref_pts.clone()         # [Nveh_filtered, 3]
 
-        # 2. generate affine matrix
-        q = torch.matmul(veh_nodes, self.wq)
-        k = torch.matmul(inf_nodes, self.wk)
-        e = torch.matmul(edges, self.we)
+        # ============================================================
+        # 2) Graph 구성: Node / Edge feature 만들기
+        # ============================================================
+        # 2.1 Node feature 구성 (veh node, inf node)
+        """
+        node feature는 query feature + motion feature를 concat해서 만든다.
+        즉 "appearance/semantic + motion"을 함께 사용해서 association을 하겠다는 의미.
 
-        attn = torch.matmul(q, k.transpose(0, 1)).unsqueeze(-1)
-        attn = attn + e
-        attn = self.ffn(attn).squeeze(-1)
+        torch.cat([inf_query, inf_motion], dim=-1) -> [Ninf, 2C]
+        get_node_inf(...) -> [Ninf, D]  (학습 가능한 projection MLP)
+        """
+        inf_nodes = self.get_node_inf(torch.cat([inf_query, inf_motion], dim=-1))  # [Ninf, D]
+        veh_nodes = self.get_node_veh(torch.cat([veh_query, veh_motion], dim=-1))  # [Nveh, D]
 
+        # 2.2 Edge feature 구성 (veh i 와 inf j 간 상대 위치)
+        """
+        dis: [Nveh, Ninf, 3]
+        dis[i, j] = veh_ref_pts[i] - inf_ref_pts[j]
+        즉, vehicle query i 와 infra query j 사이의 위치 차이를 edge feature로 사용한다.
+        """
+        dis = veh_ref_pts.unsqueeze(1) - inf_ref_pts           # [Nveh, 1, 3] - [Ninf, 3] -> broadcast -> [Nveh, Ninf, 3]
+
+        """
+        edges = get_edge(dis)
+        dis(상대좌표)을 MLP나 projection으로 feature화해서 edge embedding으로 만든다.
+        edges: [Nveh, Ninf, De]
+        """
+        edges = self.get_edge(dis)                              # [Nveh, Ninf, De]
+
+        # ============================================================
+        # 3) Attention score(attn) 생성 (veh ↔ inf affinity logit)
+        # ============================================================
+        """
+        q,k,e는 각각 node/edge를 projection해서 attention 계산에 쓰는 값
+
+        veh_nodes: [Nveh, D]
+        inf_nodes: [Ninf, D]
+        edges:     [Nveh, Ninf, De] (혹은 D로 맞춘 형태일 가능성 높음)
+        """
+
+        # q = veh query side representation
+        q = torch.matmul(veh_nodes, self.wq)   # [Nveh, D] @ [D, Dh] -> [Nveh, Dh]
+
+        # k = infra key side representation
+        k = torch.matmul(inf_nodes, self.wk)   # [Ninf, D] @ [D, Dh] -> [Ninf, Dh]
+
+        # e = edge representation
+        e = torch.matmul(edges, self.we)       # [Nveh, Ninf, De] @ [De, 1(or Dh)] -> [Nveh, Ninf, 1] 같은 형태 기대
+
+        """
+        기본 attention: q * k^T
+        [Nveh, Dh] @ [Dh, Ninf] -> [Nveh, Ninf]
+
+        unsqueeze(-1) 하는 이유:
+        edge e가 [Nveh, Ninf, 1] 처럼 마지막 차원이 있는 형태라서
+        shape 맞춰서 더하기 위해 [Nveh, Ninf] -> [Nveh, Ninf, 1] 로 바꿈
+        """
+        attn = torch.matmul(q, k.transpose(0, 1)).unsqueeze(-1)  # [Nveh, Ninf, 1]
+
+        # edge feature를 attention에 더해서 "거리/상대위치 영향" 반영
+        attn = attn + e                                         # [Nveh, Ninf, 1]
+
+        # FFN으로 한번 더 비선형 변환해서 affinity logit 완성
+        attn = self.ffn(attn).squeeze(-1)                       # [Nveh, Ninf]
+
+        # ============================================================
+        # 4) Training 모드: 매칭 idx는 반환하지 않고 attn만 반환
+        # ============================================================
+        """
+        학습 중에는 matching 결과(row/col index)를 쓰지 않는다.
+        이유:
+        - 초기 학습 때 attention 기반 matching이 불안정
+        - forward에서 "실제 fusion"은 rule-based matching을 사용하고
+        - learned matching은 attn을 loss로만 학습시키는 구조로 설계됨
+        """
         if self.training:
             return torch.tensor([], dtype=torch.long), torch.tensor([], dtype=torch.long), attn
-        # 3. output associated idxes
-        affinity = self.sigmoid(attn)
+
+        # ============================================================
+        # 5) Inference 모드: Hungarian assignment로 최종 매칭 idx 추출
+        # ============================================================
+        """
+        affinity = sigmoid(attn)
+        - affinity[i,j]가 1에 가까울수록
+            vehicle i 와 infra j가 "같은 객체"일 확률이 높다고 해석
+        """
+        affinity = self.sigmoid(attn)   # [Nveh, Ninf]
+
+        # 비어있는 경우 예외 처리
         if affinity.shape[0] == 0 or affinity.shape[1] == 0:
             return torch.tensor([], dtype=torch.long), torch.tensor([], dtype=torch.long), attn
-        
-        # affinity: close to 1 means the objects are same
+
+        # ============================================================
+        # 6) Hungarian cost matrix 만들기
+        # ============================================================
+        """
+        Hungarian은 "cost를 최소화"하는 assignment를 찾는다.
+        affinity는 "클수록 좋음" (유사도)이므로 cost로 바꾸려면 1 - affinity를 사용.
+
+        norm_diff_aff : [Nveh, Ninf]
+        - 0에 가까울수록 좋은 매칭 (affinity가 높다)
+        """
         norm_diff_aff = 1 - affinity.detach().cpu()
         diff = norm_diff_aff
+        cost = diff.numpy()  # Hungarian에 넣기 위해 numpy로 변환
 
-        cost = diff.numpy()
+        # Hungarian assignment 수행: row_ind(veh), col_ind(inf)
         row_ind, col_ind = linear_sum_assignment(cost)
+
+        """
+        cost_mask는 사실상 항상 True일 가능성이 높음.
+        (cost가 1e5 이상일 일이 없는데 threshold가 1e5임)
+        그래도 구조적으로 invalid 매칭 제거를 위해 넣어둔 것.
+        """
         cost_mask = cost[row_ind, col_ind] < 1e5
-        veh_accept_idx = row_ind[cost_mask]
-        inf_accept_idx = col_ind[cost_mask]
+
+        veh_accept_idx = row_ind[cost_mask]  # 최종 매칭된 veh 인덱스 (필터링된 veh 기준)
+        inf_accept_idx = col_ind[cost_mask]  # 최종 매칭된 inf 인덱스
+
+        # training일 때 필터링된 veh index를 원래 veh index로 되돌리기 위한 코드인데,
+        # 위에서 training이면 이미 return해서 여기까지 오지 않음 (안 쓰이는 라인)
         if self.training:
             veh_accept_idx = filter_indices[veh_accept_idx]
+
+        # torch tensor로 반환
         return torch.tensor(veh_accept_idx), torch.tensor(inf_accept_idx), attn
 
     def _query_matching(self, inf_ref_pts, veh_ref_pts, mask):
         """
-        inf_ref_pts: [..., 3] (xyz)
-        veh_ref_pts: [..., 3] (xyz)
-        veh_pred_dims: [..., 3] (dx, dy, dz)
+        [Rule-based Query Matching]
+        -------------------------------------------------------------
+        목적:
+        - Vehicle query(ref point)와 Infra query(ref point)를
+            "거리 기반"으로 1:1 매칭시키는 association 함수
+
+        입력:
+        inf_ref_pts : [N_inf, 3]
+            - infra query들의 reference points
+            - 좌표는 보통 world 좌표(absolute)로 들어옴 (denorm된 값)
+            - inf_ref_pts[i] = [x, y, z]
+
+        veh_ref_pts : [N_veh, 3]
+            - vehicle query들의 reference points
+            - 마찬가지로 world 좌표(absolute)
+            - veh_ref_pts[j] = [x, y, z]
+
+        mask : (원래는 veh query 필터링용으로 들어오지만)
+            - 이 함수 안에서는 아래에서 "distances > 3.5" 로 덮어씌워져서
+            사실상 의미가 사라짐 (주의!!)
+            - 즉, 지금 코드 기준으로는 외부 mask를 사용하지 않는 상태임
+
+        출력:
+        veh_accept_idx : [M]
+            - 매칭된 vehicle query index 목록 (veh의 인덱스)
+
+        inf_accept_idx : [M]
+            - 매칭된 infra query index 목록 (inf의 인덱스)
+
+        cost_matrix : [N_veh, N_inf]
+            - Hungarian matching에 사용된 비용 행렬
+            - cost_matrix[j, i] = veh j ↔ inf i의 거리 (혹은 매우 큰 값 1e6)
         """
-        inf_nums = inf_ref_pts.shape[0]
-        veh_nums = veh_ref_pts.shape[0]
-        cost_matrix = np.ones((veh_nums, inf_nums)) * 1e6
 
-        veh_ref_pts_np = veh_ref_pts.detach().cpu().numpy()
-        inf_ref_pts_np = inf_ref_pts.cpu().numpy()
+        # ------------------------------------------------------------
+        # 0) 개수 및 cost matrix 초기화
+        # ------------------------------------------------------------
+        inf_nums = inf_ref_pts.shape[0]   # infra query 개수 (N_inf)
+        veh_nums = veh_ref_pts.shape[0]   # vehicle query 개수 (N_veh)
 
-        veh_ref_pts_repeat = np.repeat(veh_ref_pts_np[:, np.newaxis], inf_nums, axis=1)
-        distances = np.sqrt(np.sum((veh_ref_pts_repeat - inf_ref_pts_np)**2, axis=2))
+        # Hungarian 알고리즘은 "비용(cost)이 낮을수록 좋은 매칭"으로 판단함
+        # 초기값을 매우 큰 값(1e6)으로 채워서 매칭 불가능한 pair를 만들 준비
+        cost_matrix = np.ones((veh_nums, inf_nums)) * 1e6  # shape: [N_veh, N_inf]
 
+        # ------------------------------------------------------------
+        # 1) torch tensor → numpy 변환
+        # ------------------------------------------------------------
+        # Hungarian (scipy)에서는 numpy array를 사용하므로 CPU numpy로 변환
+        # veh_ref_pts는 detach()해서 gradient 끊음 (matching은 학습 대상이 아니므로)
+        veh_ref_pts_np = veh_ref_pts.detach().cpu().numpy()  # [N_veh, 3]
+        inf_ref_pts_np = inf_ref_pts.cpu().numpy()           # [N_inf, 3]
+
+        # ------------------------------------------------------------
+        # 2) 모든 vehicle-infra pair의 거리(distance) 계산
+        # ------------------------------------------------------------
+        # veh_ref_pts_np: [N_veh, 3]
+        # inf_ref_pts_np: [N_inf, 3]
+        #
+        # 거리 계산을 위해 vehicle을 inf 개수만큼 복제해서 shape 맞춤
+        # veh_ref_pts_repeat: [N_veh, N_inf, 3]
+        veh_ref_pts_repeat = np.repeat(
+            veh_ref_pts_np[:, np.newaxis],  # [N_veh, 1, 3]
+            inf_nums,                       # 반복 횟수 = N_inf
+            axis=1                          # inf 차원으로 반복
+        )
+
+        # pairwise distance:
+        # (veh[j] - inf[i])^2 을 x,y,z에 대해 더한 뒤 sqrt
+        # distances shape: [N_veh, N_inf]
+        distances = np.sqrt(np.sum((veh_ref_pts_repeat - inf_ref_pts_np) ** 2, axis=2))
+
+        # ------------------------------------------------------------
+        # 3) 거리 threshold 기반으로 매칭 후보를 제한
+        # ------------------------------------------------------------
+        # 거리 > 3.5m 인 pair는 "매칭 후보에서 제외"시키기 위해 cost를 매우 크게 유지
+        # mask: True = 너무 멀어서 invalid
         mask = distances > 3.5
+
+        # mask가 False(= 가까운 pair)인 경우만 cost_matrix에 실제 거리 값을 넣어줌
+        # 즉 cost_matrix[j, i] = 거리 (단, 3.5m 이내만)
         cost_matrix[~mask] = distances[~mask]
-        
+
+        # ------------------------------------------------------------
+        # 4) Hungarian assignment로 1:1 최적 매칭 수행
+        # ------------------------------------------------------------
+        # linear_sum_assignment는 최소 cost가 되도록 row(veh)와 col(inf)를 매칭해줌
+        #
+        # idx_veh: vehicle 인덱스들
+        # idx_inf: 해당 vehicle과 매칭된 infra 인덱스들
+        #
+        # 예)
+        # idx_veh = [0, 1, 2]
+        # idx_inf = [5, 0, 7]
+        # -> veh0 ↔ inf5, veh1 ↔ inf0, veh2 ↔ inf7
         idx_veh, idx_inf = linear_sum_assignment(cost_matrix)
 
+        # ------------------------------------------------------------
+        # 5) "진짜 유효한 매칭"만 남기기 (후처리)
+        # ------------------------------------------------------------
+        # cost_matrix는 기본이 1e6 이므로,
+        # 매칭된 pair의 cost가 여전히 매우 큰 값이면 사실상 "매칭 실패"라고 볼 수 있음
+        #
+        # 여기서는 < 1e5 조건으로 valid 매칭만 남김
         cost_mask = cost_matrix[idx_veh, idx_inf] < 1e5
-        veh_accept_idx = idx_veh[cost_mask]
-        inf_accept_idx = idx_inf[cost_mask]
 
+        # 최종적으로 accept할 vehicle/infra index만 추출
+        veh_accept_idx = idx_veh[cost_mask]  # [M]
+        inf_accept_idx = idx_inf[cost_mask]  # [M]
+
+        # ------------------------------------------------------------
+        # 6) 최종 결과 반환
+        # ------------------------------------------------------------
         return veh_accept_idx, inf_accept_idx, cost_matrix
     
     def _gen_asso_label(self, gt_boxes, inf_boxes, veh_boxes, sample_idx):
@@ -1226,41 +1449,156 @@ class SpatialTemporalReasoner(nn.Module):
         return track_instances
 
     def update_ego(self, track_instances: Instances, l2g_r1, l2g_t1, l2g_r2, l2g_t2):
-        """Update the ego coordinates for reference points, hist_xyz, and fut_xyz of the track_instances
-           Modify the centers of the bboxes at the same time
-        Args:
-            track_instances: objects
-            l2g0: a [4x4] matrix for current frame lidar-to-global transformation 
-            l2g1: a [4x4] matrix for target frame lidar-to-global transformation
-        Return:
-            transformed track_instances (inplace)
         """
+        [Ego-motion 보정 함수]
+        -----------------------------------------------------------
+        목적:
+        - ego 차량이 움직이면(local frame이 바뀜) 이전 프레임에서 유지하던
+            reference points(ref_pts), history positions(hist_xyz),
+            future predicted positions(fut_xyz) 등이
+            "현재 프레임 기준 좌표계"와 맞지 않게 된다.
+        - 그래서 ego pose 변화(l2g_r1,t1 -> l2g_r2,t2)를 이용해서
+            track_instances 내부 좌표들을 "현재 프레임 기준"으로 변환한다.
+
+        입력:
+        track_instances:
+            - ref_pts:          [num_query, 3]  (normalized)
+            - pred_boxes:       [num_query, box_dim] (world scale or mixed)
+            - hist_xyz:         [num_query, hist_len, 3] (normalized)
+            - hist_bboxes:      [num_query, hist_len, 10] (보통 world scale)
+            - fut_xyz:          [num_query, fut_len, 3] (normalized)
+            - fut_bboxes:       [num_query, fut_len, 10] (world scale)
+
+        l2g_r1, l2g_t1:
+            - 이전 프레임 lidar(local) -> global 변환(rotation, translation)
+        l2g_r2, l2g_t2:
+            - 현재 프레임 lidar(local) -> global 변환(rotation, translation)
+
+        핵심 사용 함수:
+        xyz_ego_transformation(...)
+            - src frame 좌표(또는 normalized 좌표)를
+            ego pose 변화량을 이용해 target frame 기준 좌표로 변환해줌
+
+        pc_range:
+        - normalize/denormalize에 필요한 point cloud 범위
+        - 예: [xmin, ymin, zmin, xmax, ymax, zmax]
+        """
+
         # TODO: orientation of the bounding boxes
-        """1. Current states"""
+        # (현재는 bbox의 center(x,y,z)만 변환하고, heading/yaw 같은 orientation은 고려 안 했다는 의미)
+
+        # ============================================================
+        # 1) Current states: 현재 프레임 ref_pts / pred_boxes 중심점 업데이트
+        # ============================================================
+
+        # ref_pts: [num_query, 3]
+        # track query가 현재 프레임에서 바라보는 reference point (보통 normalized 좌표 0~1)
         ref_points = track_instances.ref_pts.clone()
-        physical_ref_points = xyz_ego_transformation(ref_points, l2g_r1, l2g_t1, l2g_r2, l2g_t2, self.pc_range,
-                                                     src_normalized=True, tgt_normalized=False)
+
+        """
+        xyz_ego_transformation 설명:
+        - ref_points는 src_normalized=True 이므로 (0~1 normalize된 상태)
+        - src frame (이전 frame 기준) -> tgt frame (현재 frame 기준)
+        - tgt_normalized=False 이므로 결과는 "실제 물리 좌표(world/metric)"로 출력됨
+
+        즉,
+        normalized(이전 frame 기준) -> 실제좌표(현재 frame 기준)
+        """
+        physical_ref_points = xyz_ego_transformation(
+            ref_points,
+            l2g_r1, l2g_t1,
+            l2g_r2, l2g_t2,
+            self.pc_range,
+            src_normalized=True,   # 입력 ref_points는 normalized
+            tgt_normalized=False   # 출력 physical_ref_points는 실제 좌표
+        )
+
+        """
+        pred_boxes[..., [0,1,4]] 의미:
+        bbox 코드가 (cx, cy, cz, w, l, h, rot, vx, vy, ...) 형태라고 가정할 때
+        [0] : center x
+        [1] : center y
+        [4] : center z  (이 코드에서는 z가 index 4에 들어있는 구조를 사용 중)
+        
+        즉, bbox의 중심 좌표만 ego motion에 맞게 갱신한다.
+        """
         track_instances.pred_boxes[..., [0, 1, 4]] = physical_ref_points.clone()
+
+        # ref_pts는 계속 normalized 형태로 유지하는 구조라서,
+        # physical_ref_points(실제 좌표)를 다시 normalize 해서 ref_pts에 저장
         track_instances.ref_pts = normalize(physical_ref_points, self.pc_range)
-        
-        """2. History states"""
+
+        # ============================================================
+        # 2) History states: 과거 프레임 히스토리 버퍼(hist_xyz, hist_bboxes) 좌표 보정
+        # ============================================================
+
+        # inst_num = num_query (track_instances 내부 query 개수)
         inst_num = len(track_instances)
+
+        """
+        hist_xyz shape: [num_query, hist_len, 3]
+        여기서는 변환을 한번에 하기 위해 flatten:
+        [inst_num * hist_len, 3]
+        즉, 모든 query들의 모든 time slot 위치를 한 덩어리로 변환한다.
+        """
         hist_ref_xyz = track_instances.hist_xyz.clone().view(inst_num * self.hist_len, 3)
-        physical_hist_ref = xyz_ego_transformation(hist_ref_xyz, l2g_r1, l2g_t1, l2g_r2, l2g_t2, self.pc_range,
-                                                   src_normalized=True, tgt_normalized=False)
+
+        # hist_ref_xyz도 normalized 좌표이므로 src_normalized=True
+        # 변환 결과는 실제 좌표(현재 frame 기준)로 받기 위해 tgt_normalized=False
+        physical_hist_ref = xyz_ego_transformation(
+            hist_ref_xyz,
+            l2g_r1, l2g_t1,
+            l2g_r2, l2g_t2,
+            self.pc_range,
+            src_normalized=True,
+            tgt_normalized=False
+        )
+
+        # 다시 원래 형태 [num_query, hist_len, 3] 로 reshape
         physical_hist_ref = physical_hist_ref.reshape(inst_num, self.hist_len, 3)
+
+        """
+        hist_bboxes[..., [0,1,4]] 역시 bbox center 위치 업데이트
+        hist_bboxes는 "과거 프레임 bbox 정보"를 저장하는 buffer로,
+        여기서는 center(x,y,z)만 갱신함
+        """
         track_instances.hist_bboxes[..., [0, 1, 4]] = physical_hist_ref
+
+        # hist_xyz는 계속 normalized 형태로 유지하므로 다시 normalize해서 저장
         track_instances.hist_xyz = normalize(physical_hist_ref, self.pc_range)
-        
-        """3. Future states"""
+
+        # ============================================================
+        # 3) Future states: 미래 예측 좌표(fut_xyz, fut_bboxes)도 동일하게 ego 보정
+        # ============================================================
+
         inst_num = len(track_instances)
+
+        """
+        fut_xyz shape: [num_query, fut_len, 3]
+        마찬가지로 flatten해서 한번에 변환:
+        [inst_num * fut_len, 3]
+        """
         fut_ref_xyz = track_instances.fut_xyz.clone().view(inst_num * self.fut_len, 3)
-        physical_fut_ref = xyz_ego_transformation(fut_ref_xyz, l2g_r1, l2g_t1, l2g_r2, l2g_t2, self.pc_range,
-                                                   src_normalized=True, tgt_normalized=False)
+
+        physical_fut_ref = xyz_ego_transformation(
+            fut_ref_xyz,
+            l2g_r1, l2g_t1,
+            l2g_r2, l2g_t2,
+            self.pc_range,
+            src_normalized=True,
+            tgt_normalized=False
+        )
+
+        # reshape back: [num_query, fut_len, 3]
         physical_fut_ref = physical_fut_ref.reshape(inst_num, self.fut_len, 3)
+
+        # 미래 bbox buffer의 center도 갱신
         track_instances.fut_bboxes[..., [0, 1, 4]] = physical_fut_ref
+
+        # fut_xyz도 normalized 형태로 유지
         track_instances.fut_xyz = normalize(physical_fut_ref, self.pc_range)
 
+        # 최종적으로 track_instances를 inplace 업데이트해서 반환
         return track_instances
     
     def update_reference_points(self, track_instances, time_deltas, use_prediction=True, tracking=False):
