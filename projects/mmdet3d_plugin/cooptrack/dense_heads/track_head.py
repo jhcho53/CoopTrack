@@ -160,85 +160,228 @@ class BEVFormerTrackHead(DETRHead):
         return bev_embed, bev_pos
 
     def get_detections(
-        self, 
+        self,
         bev_embed,
         query_feats,
         query_embeds,
         ref_points,
         img_metas=None,
     ):
+        """
+        [BEV 기반 Detection 수행 함수]
+        - BEVFormer / DETR-style decoder를 이용해
+        "track query(= object query)"들이 BEV feature를 보고 물체를 탐지하도록 한다.
+        - 입력으로는 BEV embedding + query feature/pos embedding + reference point를 받으며,
+        Transformer decoder layer별로 classification / bbox regression 결과를 생성한다.
+
+        Args:
+            bev_embed (Tensor):
+                - shape: [bev_h*bev_w, bs, embed_dims] 또는 [bev_h*bev_w, embed_dims] 형태로 유지되는 경우도 있음
+                - BEV 공간(H*W) 위의 feature embedding
+                - Transformer에서 key/value(memory)로 사용됨
+
+            query_feats (Tensor):
+                - shape: [bs, num_query, embed_dims]  (CoopTrack에서 stack해서 넘김)
+                - object query의 "content embedding" (query의 feature / hidden state)
+
+            query_embeds (Tensor):
+                - shape: [bs, num_query, embed_dims]
+                - object query의 positional embedding
+                - 보통 ref_pts 기반으로 pos2posemb3d → MLP를 통해 생성
+
+            ref_points (Tensor):
+                - shape: [bs, num_query, 3]
+                - object query의 reference point (normalized 좌표)
+                - 여기서 3차원은 보통 (x, y, z) 또는 (x, y, 높이 z) 느낌으로 사용됨
+                - DETR box refine에서 "초기 anchor" 역할
+
+            img_metas:
+                - calibration, ego, scene 정보 등 meta dict
+                - transformer 내부에서 필요할 수 있음(예: camera 파라미터)
+
+        Returns:
+            outs (dict):
+                outs = {
+                    'all_cls_scores': [num_layers, bs, num_query, num_cls]
+                        - decoder layer마다 나온 classification logits
+                    'all_bbox_preds': [num_layers, bs, num_query, box_dim]
+                        - decoder layer마다 나온 bbox regression 결과 (일부는 denormalize된 실제 좌표)
+                    'last_ref_points': [bs, num_query, 3]
+                        - 마지막 layer에서 update된 reference points (normalized)
+                    'query_feats': [num_layers, bs, num_query, embed_dims]
+                        - decoder layer별 query hidden states
+                }
+        """
+
+        # BEV embedding은 [bev_h*bev_w, ...] 형태여야 함
         assert bev_embed.shape[0] == self.bev_h * self.bev_w
-        # hs = 각 Decoder Layer의 Query Hidden states 
+
+        # ============================================================
+        # (1) Transformer Decoder 수행: Query hidden state + reference 업데이트 획득
+        # ============================================================
+        # hs:
+        #   - 각 decoder layer의 query hidden states
+        #   - shape: [num_layers, num_query, bs, embed_dims]
+        #
+        # init_reference:
+        #   - 초기 reference point (보통 입력 ref_points 기반)
+        #
+        # inter_references:
+        #   - decoder layer가 반복될 때마다 update된 reference point들
+        #   - shape: [num_layers-1, num_query, bs, 3] 또는 유사 형태
+        #
+        # get_states_and_refs는 "decoder 출력 hs"와 "layer별 reference 업데이트"를 같이 반환하는 함수
         hs, init_reference, inter_references = self.transformer.get_states_and_refs(
             bev_embed,
             query_feats,
             query_embeds,
             self.bev_h,
             self.bev_w,
-            reference_points=ref_points,
+            reference_points=ref_points,  # 초기 reference point로 ref_points 사용
             reg_branches=self.reg_branches if self.with_box_refine else None,
             cls_branches=self.cls_branches if self.as_two_stage else None,
             img_metas=img_metas,
         )
-        # [num_layers, num_query, bs, embed_dims] -> [num_layers, bs, num_query, embed_dims]
+
+        # hs의 shape을 후처리하기 쉽게 바꾼다.
+        # [num_layers, num_query, bs, C] -> [num_layers, bs, num_query, C]
+        # index 설명:
+        #   - (0) decoder layer index
+        #   - (1) batch index
+        #   - (2) query index
+        #   - (3) embedding channel
         hs = hs.permute(0, 2, 1, 3)
-        outputs_classes = []
-        outputs_coords = []
-        outputs_trajs = []
-        # Decoder Layer 별로 classification/regression 수행
+
+        # 각 layer별 결과를 저장할 list
+        outputs_classes = []  # classification 결과 logits
+        outputs_coords = []   # bbox regression 결과
+        outputs_trajs = []    # (옵션) trajectory 예측 결과 (현재는 사용 안함)
+
+        # ============================================================
+        # (2) Decoder Layer별 classification / bbox regression 수행
+        # ============================================================
+        # hs.shape[0] == num_layers
         for lvl in range(hs.shape[0]):
+
+            # ------------------------------------------------------------
+            # (2-A) 이번 decoder layer에서 사용할 reference point 결정
+            # ------------------------------------------------------------
             if lvl == 0:
-                # reference = init_reference
-                reference = ref_points # 첫 layer는 주어진 ref points를 그대로 reference로 사용
+                # 첫 layer는 "입력으로 들어온 ref_points"를 그대로 사용
+                # (init_reference를 사용하는 구현도 있는데 여기서는 ref_points를 바로 씀)
+                reference = ref_points
             else:
-                reference = inter_references[lvl - 1] # 다음 layer부터는 이전 layer에서 update된 reference를 사용
-                # ref_size_base = inter_box_sizes[lvl - 1]
+                # 2번째 layer부터는 바로 이전 layer에서 업데이트된 reference를 사용
+                # inter_references[lvl-1] = "이전 layer에서 update된 ref"
+                reference = inter_references[lvl - 1]
+
+            # reference는 sigmoid 공간(0~1)으로 들어있을 가능성이 높기 때문에
+            # box refine에서 더하기(add)를 하기 위해 inverse_sigmoid로 logit 공간으로 변환
+            # (DETR의 iterative box refinement 방식)
             reference = inverse_sigmoid(reference)
-            outputs_class = self.cls_branches[lvl](hs[lvl]) # Classification head
-            tmp = self.reg_branches[lvl](hs[lvl])  # xydxdyxdz # Regression head
-            # outputs_past_traj = self.past_traj_reg_branches[lvl](hs[lvl]).view(
-            #     tmp.shape[0], -1, self.past_steps + self.fut_steps, 2)
-            # TODO: check the shape of reference
+
+            # ------------------------------------------------------------
+            # (2-B) Classification head 수행
+            # ------------------------------------------------------------
+            # cls_branches[lvl]: layer별 cls head
+            # hs[lvl]: [bs, num_query, C]
+            # outputs_class: [bs, num_query, num_cls]
+            outputs_class = self.cls_branches[lvl](hs[lvl])
+
+            # ------------------------------------------------------------
+            # (2-C) Regression head 수행 (bbox delta 예측)
+            # ------------------------------------------------------------
+            # reg_branches[lvl]: layer별 bbox regression head
+            # tmp: [bs, num_query, box_dim]
+            # 주석 "xydxdyxdz"는 box dim 구성에 따라 의미가 다르지만,
+            # 중요한 건 tmp가 bbox의 normalized prediction을 뱉는다는 점
+            tmp = self.reg_branches[lvl](hs[lvl])
+
+            # reference는 [bs, num_query, 3] 형태여야 함 (x,y,z)
             assert reference.shape[-1] == 3
-            # DETR 형태의 Box Refine
+
+            # ============================================================
+            # (3) DETR-style Box Refinement (Iterative Refinement)
+            # ============================================================
+            # DETR iterative refinement 핵심 아이디어:
+            # - regression head는 "절대 좌표"를 바로 예측하지 않고
+            #   "reference point 기준 offset(delta)"를 예측한다.
+            # - 그래서 tmp의 일부 좌표에 reference를 더하고 sigmoid를 취해 다시 0~1로 맞춘다.
+
+            # ------------------------------------------------------------
+            # (3-A) x, y 좌표 refine
+            # ------------------------------------------------------------
+            # tmp[..., 0:2] 는 bbox의 center (x,y) 부분이라고 가정
+            # reference[..., 0:2] 는 ref point의 (x,y)
+            # inverse_sigmoid 공간에서 더한 뒤 sigmoid로 다시 0~1 범위로 복원
             tmp[..., 0:2] += reference[..., 0:2]
             tmp[..., 0:2] = tmp[..., 0:2].sigmoid()
+
+            # ------------------------------------------------------------
+            # (3-B) z(ref height) 좌표 refine
+            # ------------------------------------------------------------
+            # tmp[..., 4:5] 는 bbox의 z(또는 height offset)로 잡혀 있음
+            # reference[..., 2:3] 는 ref point의 z 성분
+            # 동일하게 refine 후 sigmoid로 0~1로 복귀
             tmp[..., 4:5] += reference[..., 2:3]
             tmp[..., 4:5] = tmp[..., 4:5].sigmoid()
 
+            # ------------------------------------------------------------
+            # (3-C) 마지막 reference point(last_ref_points) 기록
+            # ------------------------------------------------------------
+            # last_ref_points는 다음 layer reference 업데이트를 위한 normalized ref 저장용
+            # 구성: [x, y, z] 만 모아서 저장
+            # (tmp의 x,y는 0~1 normalized, tmp의 4는 z normalized)
             last_ref_points = torch.cat(
-                [tmp[..., 0:2], tmp[..., 4:5]], dim=-1,
+                [tmp[..., 0:2], tmp[..., 4:5]],
+                dim=-1,   # 마지막 차원에서 concat해서 [bs, num_query, 3] 형태
             )
-            # Normalized된 값을 실제 좌표로 Denormalize
-            tmp[..., 0:1] = (tmp[..., 0:1] * (self.pc_range[3] -
-                             self.pc_range[0]) + self.pc_range[0])
-            tmp[..., 1:2] = (tmp[..., 1:2] * (self.pc_range[4] -
-                             self.pc_range[1]) + self.pc_range[1])
-            tmp[..., 4:5] = (tmp[..., 4:5] * (self.pc_range[5] -
-                             self.pc_range[2]) + self.pc_range[2])
 
-            # tmp[..., 2:4] = tmp[..., 2:4] + ref_size_basse[..., 0:2]
-            # tmp[..., 5:6] = tmp[..., 5:6] + ref_size_basse[..., 2:3]
+            # ============================================================
+            # (4) Denormalize: normalized (0~1) -> 실제 meter 좌표로 변환
+            # ============================================================
+            # pc_range: [x_min, y_min, z_min, x_max, y_max, z_max]
+            #
+            # tmp[..., 0] = x normalized
+            # tmp[..., 1] = y normalized
+            # tmp[..., 4] = z normalized
+            #
+            # 실제 좌표 = normalized * (max-min) + min
+            tmp[..., 0:1] = (tmp[..., 0:1] * (self.pc_range[3] - self.pc_range[0]) + self.pc_range[0])  # x
+            tmp[..., 1:2] = (tmp[..., 1:2] * (self.pc_range[4] - self.pc_range[1]) + self.pc_range[1])  # y
+            tmp[..., 4:5] = (tmp[..., 4:5] * (self.pc_range[5] - self.pc_range[2]) + self.pc_range[2])  # z
 
-            # TODO: check if using sigmoid
+            # ------------------------------------------------------------
+            # (5) layer 출력 저장
+            # ------------------------------------------------------------
             outputs_coord = tmp
             outputs_classes.append(outputs_class)
             outputs_coords.append(outputs_coord)
-            # outputs_trajs.append(outputs_past_traj)
-        # Layer별 Output Stack
+            # outputs_trajs.append(outputs_past_traj)  # trajectory 예측을 쓰면 여기 저장
+
+        # ============================================================
+        # (6) Layer별 결과 stack해서 반환 형태 맞추기
+        # ============================================================
+        # outputs_classes: list of [bs, num_query, num_cls]
+        # -> [num_layers, bs, num_query, num_cls]
         outputs_classes = torch.stack(outputs_classes)
+
+        # outputs_coords: list of [bs, num_query, box_dim]
+        # -> [num_layers, bs, num_query, box_dim]
         outputs_coords = torch.stack(outputs_coords)
-        # outputs_trajs = torch.stack(outputs_trajs)
-        # last_ref_points = inverse_sigmoid(last_ref_points)
+
+        # ============================================================
+        # (7) 최종 반환 dict 구성
+        # ============================================================
         outs = {
-            'all_cls_scores': outputs_classes, #[num_layers, bs, num_query, num_cls]
-            'all_bbox_preds': outputs_coords, #[num_layers, bs, num_query, num_dim]
-            # 'all_past_traj_preds': outputs_trajs,
-            'enc_cls_scores': None,
-            'enc_bbox_preds': None,
-            'last_ref_points': last_ref_points, #[bs, num_query, 3]
-            'query_feats': hs, #[num_layers, bs, num_query, embed_dims]
+            'all_cls_scores': outputs_classes,   # [num_layers, bs, num_query, num_cls]
+            'all_bbox_preds': outputs_coords,    # [num_layers, bs, num_query, box_dim]
+            'enc_cls_scores': None,              # encoder output 사용하는 2-stage 방식이면 여기 채워짐
+            'enc_bbox_preds': None,              # encoder output 사용하는 2-stage 방식이면 여기 채워짐
+            'last_ref_points': last_ref_points,  # [bs, num_query, 3] (normalized, 다음 layer/ref update용)
+            'query_feats': hs,                   # [num_layers, bs, num_query, embed_dims] (decoder hidden states)
         }
+
         return outs
         
     def _get_target_single(self,

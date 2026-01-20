@@ -821,94 +821,184 @@ class CoopTrack(MVXTwoStageDetector):
         **kwargs,
     ):
         """
-        Perform forward only on one frame. Called in  forward_train
-        Warnning: Only Support BS=1
-        Args:
-            img: shape [B, num_cam, 3, H, W]
-            if l2g_r2 is None or l2g_t2 is None:
-                it means this frame is the end of the training clip,
-                so no need to call velocity update
-        """
-        assert self.batch_size == len(track_instances)
-        for i in range(self.batch_size):    
-            prev_active_track_instances = track_instances[i]
+        [단일 프레임 학습 forward]
+        - seq_mode에서 streaming train을 할 때, "현재 프레임 1장"에 대해서만
+        tracking + detection loss + (optional) motion/future/history reasoning loss를 계산하고,
+        다음 프레임으로 넘길 track_instances(active instances) 를 구성한다.
+        - 기본적으로 BS>1도 처리하는 형태로 작성되어 있지만, 주석대로 clip 단위 train에서 BS=1을 가정하는 코드가 많음.
 
+        Args:
+            img: [B, num_cam, 3, H, W]
+            img_metas: batch 크기 만큼의 meta dict list
+            track_instances: 길이 B짜리 list
+                - 각 원소는 Instances이며, 이전 프레임에서 살아남은(active) track query 들만 들어있음
+                - None이면 첫 프레임으로 취급하여 empty tracks를 생성함
+            prev_bev: 이전 프레임의 BEV feature (streaming train에서는 외부에서 유지)
+            l2g_r1/t1, l2g_r2/t2: 이전 프레임과 현재 프레임 사이 ego motion 보정용 (local->global 변환)
+            time_delta: 프레임 간 시간 차이
+            veh2inf_rt: 협력(cooperation)일 때 vehicle 좌표계 -> infra 좌표계 정렬을 위한 변환
+            gt_*: detection/tracking loss, motion forecasting loss를 위한 GT 정보
+            kwargs: cooperation에서 infra model 쿼리 결과(혹은 저장된 결과)가 넘어오는 곳
+
+        Returns:
+            out: {
+                'track_instances': [B개],   # 다음 프레임으로 넘길 active track instances
+                'bev_embed': bev_embed,      # 현재 프레임 BEV embedding
+                'bev_pos': bev_pos,          # BEV positional embedding
+            }
+            losses: batch 평균 처리된 loss dict
+        """
+
+        # track_instances는 batch 크기만큼 리스트로 들어오며, self.batch_size와 일치해야 한다.
+        assert self.batch_size == len(track_instances)
+
+        # =========================================================================
+        # (A) 이전 프레임에서 넘어온 track_instances를 "현재 프레임 입력 query"로 재구성
+        #     - 이전 프레임 active query들을 기반으로 reference point/ego를 업데이트
+        #     - 부족한 개수는 empty queries로 채워서 "고정 num_query" 형태로 맞춘다.
+        # =========================================================================
+        for i in range(self.batch_size):
+            prev_active_track_instances = track_instances[i]  # 이전 프레임에서 살아남은(active) query들
+
+            # (A-1) 첫 프레임이거나 scene이 바뀌어서 이전 track이 없으면, 완전 초기 query set 생성
             if prev_active_track_instances is None:
+                # num_query개의 빈 트랙(참조점/ref_pts, query_embeds, query_feats 포함) 생성
                 track_instances[i] = self._generate_empty_tracks()
+
+            # (A-2) 이전 프레임 track이 있다면, 다음 프레임으로 "예측 기반 ref 갱신 + ego 보정" 수행
             else:
-                prev_active_track_instances = self.update_reference_points(prev_active_track_instances,
-                                                                                time_delta[i],
-                                                                                use_prediction=self.motion_prediction_ref_update,
-                                                                                tracking=False)
+                # 1) 시간차(time_delta)를 이용하여 motion prediction(또는 velocity)을 기반으로
+                #    reference point(ref_pts)를 다음 프레임 위치로 업데이트
+                prev_active_track_instances = self.update_reference_points(
+                    prev_active_track_instances,
+                    time_delta[i],
+                    use_prediction=self.motion_prediction_ref_update,  # 예측값 기반 ref update 사용 여부
+                    tracking=False
+                )
+
+                # 2) ego motion 보정이 켜져있다면, local->global 변환(l2g_r/t)로 이전 track들을 현재 ego 기준으로 변환
                 if self.if_update_ego:
-                    prev_active_track_instances = self.update_ego(prev_active_track_instances, 
-                                                                l2g_r1[i], l2g_t1[i], l2g_r2[i], l2g_t2[i])
-                prev_active_track_instances = self.STReasoner.sync_pos_embedding(prev_active_track_instances, self.query_embedding) # positional embedding update
-            
+                    prev_active_track_instances = self.update_ego(
+                        prev_active_track_instances,
+                        l2g_r1[i], l2g_t1[i], l2g_r2[i], l2g_t2[i]
+                    )
+
+                # 3) ref_pts가 바뀌었으니 positional embedding(query_embeds)을 최신 ref_pts 기준으로 동기화
+                #    (query_embedding(pos2posemb3d(ref_pts)) 같은 방식으로 업데이트)
+                prev_active_track_instances = self.STReasoner.sync_pos_embedding(
+                    prev_active_track_instances,
+                    self.query_embedding
+                )
+
+                # 4) 현재 프레임에서 detection head에 넣을 query 개수는 고정(num_query)이므로
+                #    active query 수가 적으면 empty query로 채워 넣어야 한다.
                 empty_track_instances = self._generate_empty_tracks()
-                full_length = len(empty_track_instances)
-                active_length = len(prev_active_track_instances)
+                full_length = len(empty_track_instances)             # 전체 query 개수 (예: 900)
+                active_length = len(prev_active_track_instances)     # 살아남은 query 개수
+
+                # active query가 존재하면, empty query에서 (full-active) 개를 랜덤 샘플링하여 가져온다.
+                # 즉, "empty 일부 + prev_active 전부"를 concat해서 최종 num_query로 맞춤
                 if active_length > 0:
                     random_index = torch.randperm(full_length)
-                    selected = random_index[:full_length-active_length]
+                    selected = random_index[:full_length - active_length]
                     empty_track_instances = empty_track_instances[selected]
+
+                # empty + active를 이어붙여서 "num_query"로 구성된 Instances 생성
                 out_track_instances = Instances.cat([empty_track_instances, prev_active_track_instances])
                 track_instances[i] = out_track_instances
+
+            # (A-3) optional: query 순서를 섞어서 학습 시 편향을 줄이는 용도(데이터 증강 느낌)
             if self.shuffle:
-                # shuffle the instances
                 shuffle_index = torch.randperm(len(track_instances[i]))
-                # print(len(shuffle_index))
                 track_instances[i] = track_instances[i][shuffle_index]
-        
+
+        # =========================================================================
+        # (B) 현재 프레임 이미지 -> BEV 생성 (BEVFormer encoder)
+        # =========================================================================
+        # prev_bev가 들어오면 temporal fusion 방식으로 현재 bev_embed를 만들 수 있음
         bev_embed, bev_pos = self.get_bevs(img, img_metas, prev_bev=prev_bev)
 
+        # =========================================================================
+        # (C) Detection Head 수행: track query를 input query로 넣어서 디텍션 출력 얻기
+        # =========================================================================
+        # query_feats/query_embeds/ref_pts는 Instances에 저장되어 있던 값을 꺼내 stack 한다.
         det_output = self.pts_bbox_head.get_detections(
             bev_embed,
-            query_feats=torch.stack([ins.query_feats for ins in track_instances]),
-            query_embeds=torch.stack([ins.query_embeds for ins in track_instances]),
-            ref_points=torch.stack([ins.ref_pts for ins in track_instances]),
+            query_feats=torch.stack([ins.query_feats for ins in track_instances]),   # [B, num_query, C]
+            query_embeds=torch.stack([ins.query_embeds for ins in track_instances]), # [B, num_query, C]
+            ref_points=torch.stack([ins.ref_pts for ins in track_instances]),        # [B, num_query, 3]
             img_metas=img_metas,
         )
 
-        output_classes = det_output["all_cls_scores"] # [num_layers, bs, num_query, num_cls]
-        output_coords = det_output["all_bbox_preds"] #[num_layers, bs, num_query, num_dim]
-        last_ref_pts = det_output["last_ref_points"] #[bs, num_query, 3]
-        query_feats = det_output["query_feats"] #[num_layers, bs, num_query, embed_dims]
+        # det_output은 decoder layer별 결과를 포함
+        output_classes = det_output["all_cls_scores"]   # [num_layers, B, num_query, num_cls]
+        output_coords  = det_output["all_bbox_preds"]   # [num_layers, B, num_query, box_dim]
+        last_ref_pts   = det_output["last_ref_points"]  # [B, num_query, 3] (마지막 layer의 ref pts)
+        query_feats    = det_output["query_feats"]      # [num_layers, B, num_query, C]
 
-        losses = {}
+        # =========================================================================
+        # (D) Loss / Reasoning을 위한 loop (batch별 처리)
+        # =========================================================================
+        losses = {}  # batch 전체 loss 누적용
         out = {
-            'track_instances': [],
+            'track_instances': [],  # 다음 프레임으로 넘길 active instances들
             'bev_embed': bev_embed,
             'bev_pos': bev_pos,
         }
-        avg_factors = {}
+        avg_factors = {}  # loss normalization을 위한 avg_factor 누적
+
         for j in range(self.batch_size):
-            # 0. get infos of current batch
+            # ---------------------------------------------
+            # (D-0) 현재 batch의 예측 결과 패키징
+            # ---------------------------------------------
             cur_loss = dict()
             cur_track_instances = track_instances[j]
-            cur_out = {
-                'all_cls_scores': output_classes[:, j, :, :],
-                'all_bbox_preds': output_coords[:, j, :, :],
-                'ref_pts': last_ref_pts[j, :, :],
-                'query_feats': query_feats[:, j, :, :],
-            }
-            # 1. Record the information into the track instances cache
-            cur_track_instances = self.load_detection_output_into_cache(cur_track_instances, cur_out) # Detection head에서 나온 출력을 track query에 삽입
-            cur_out['track_instances'] = cur_track_instances
-            
-            # 2. loss for detection
-            if not self.is_cooperation:
-                cur_track_instances = self.loss_single_batch(gt_bboxes_3d[j],
-                                    gt_labels_3d[j],
-                                    gt_inds[j],
-                                    cur_out)
-                cur_loss.update(self.criterion.losses_dict)
-            # extract motion feature
-            if self.is_motion:
-                cur_track_instances = self.MotionExtractor(cur_track_instances, img_metas[j]) # bbox로부터 motion feature를 뽑아 tracker/temporal reasoner가 사용하게 만들기
 
+            # 현재 batch j에 대한 detection head output slice
+            cur_out = {
+                'all_cls_scores': output_classes[:, j, :, :],  # [num_layers, num_query, num_cls]
+                'all_bbox_preds': output_coords[:, j, :, :],   # [num_layers, num_query, box_dim]
+                'ref_pts': last_ref_pts[j, :, :],              # [num_query, 3]
+                'query_feats': query_feats[:, j, :, :],        # [num_layers, num_query, C]
+            }
+
+            # ---------------------------------------------
+            # (D-1) detection 결과를 track_instances.cache_* 에 기록
+            #       (cache_logits/cache_bboxes/cache_scores/cache_query_feats/cache_ref_pts 등)
+            # ---------------------------------------------
+            cur_track_instances = self.load_detection_output_into_cache(cur_track_instances, cur_out)
+            cur_out['track_instances'] = cur_track_instances
+
+            # ---------------------------------------------
+            # (D-2) Detection loss 계산 (cooperation이 아닐 때만)
+            #       - Hungarian matching을 통해 query <-> GT를 매칭하고 loss 계산
+            # ---------------------------------------------
+            if not self.is_cooperation:
+                cur_track_instances = self.loss_single_batch(
+                    gt_bboxes_3d[j],
+                    gt_labels_3d[j],
+                    gt_inds[j],
+                    cur_out
+                )
+                # criterion 내부에서 계산된 losses_dict를 현재 프레임 loss에 합침
+                cur_loss.update(self.criterion.losses_dict)
+
+            # ---------------------------------------------
+            # (D-3) optional: motion feature 추출 (bbox 기반)
+            #       - STReasoner나 future prediction 등에 사용할 motion embedding 생성
+            # ---------------------------------------------
+            if self.is_motion:
+                cur_track_instances = self.MotionExtractor(cur_track_instances, img_metas[j])
+
+            # ---------------------------------------------
+            # (D-4) Cooperation mode: Infra side query를 받아서 inf_instances 구성
+            #       - kwargs에는 infra model 출력(혹은 미리 저장된 출력)이 들어온다.
+            #       - crossview_alignment로 vehicle 좌표계와 infra 좌표계를 정렬(CAA)
+            #       - learn_match가 켜져있으면 association label 생성용 GT 매칭도 수행
+            # ---------------------------------------------
             inf_instances = None
             if self.is_cooperation:
+                # infra에서 전달된 query 출력 dict 구성
                 inf_dcit = {
                     'query_feats': kwargs['query_feats'][j][0],
                     'query_embeds': kwargs['query_embeds'][j][0],
@@ -916,85 +1006,164 @@ class CoopTrack(MVXTwoStageDetector):
                     'ref_pts': kwargs['ref_pts'][j][0],
                     'pred_boxes': kwargs['pred_boxes'][j][0],
                 }
+
+                # infra query가 존재할 때만 사용
                 if inf_dcit['query_feats'].shape[0] > 0:
-                    inf_dcit = self.crossview_alignment(inf_dcit, veh2inf_rt[j]) # CAA
-                    inf_instances = self._init_inf_tracks(inf_dcit) # buffer 초기화 + history buffer의 마지막에 현재 frame 삽입
+                    # vehicle->infra 변환(veh2inf_rt)을 이용해 latent feature alignment 수행
+                    inf_dcit = self.crossview_alignment(inf_dcit, veh2inf_rt[j])
+
+                    # infra query들을 Instances 컨테이너로 초기화하고 history buffer 세팅
+                    inf_instances = self._init_inf_tracks(inf_dcit)
+
+                # veh-inf association 학습(learn_match)일 때 GT 기반 positive matrix 생성
                 if self.STReasoner.learn_match:
+                    # vehicle query 중 confidence가 일정 threshold 이상인 것만 association에 사용
+                    # (배경/빈 query를 줄여서 매칭 노이즈 감소)
                     mask = cur_track_instances.cache_scores > self.STReasoner.veh_thre
+
                     veh_boxes = cur_track_instances[mask].cache_bboxes.clone()
                     inf_boxes = inf_instances.cache_bboxes.clone()
-                    # veh_boxes와 inf_boxes를 각각 GT와 Hungarian matching으로 붙인 후, 같은 GT에 매칭된 veh-inf 쌍을 positive(1)로 표시한 association label matrix를 생성
-                    asso_label = self.STReasoner._gen_asso_label(gt_bboxes_3d[j], inf_boxes, veh_boxes, img_metas[j]['sample_idx'])
-            # 3. Spatial-temporal reasoning
+
+                    # GT 기준으로 (veh<->GT) & (inf<->GT) Hungarian matching 후
+                    # 같은 GT에 붙은 veh-inf pair를 label=1로 만든 matrix 생성
+                    asso_label = self.STReasoner._gen_asso_label(
+                        gt_bboxes_3d[j],
+                        inf_boxes,
+                        veh_boxes,
+                        img_metas[j]['sample_idx']
+                    )
+
+            # ---------------------------------------------
+            # (D-5) Spatial-Temporal Reasoning 수행 (STReasoner)
+            #       - cur_track_instances.cache_* 를 업데이트/refine
+            #       - cooperation이면 inf_instances까지 함께 reasoning
+            #       - affinity: veh-inf 유사도(association) 예측값
+            # ---------------------------------------------
             cur_track_instances, affinity = self.STReasoner(cur_track_instances, inf_instances)
 
+            # ---------------------------------------------
+            # (D-6) Cooperation mode에서 fused 결과로 detection loss 다시 계산
+            #       - STReasoner가 업데이트한 cache_logits/cache_bboxes를 "최종 예측"으로 보고 loss 계산
+            #       - association loss(affinity vs asso_label)도 추가 학습 가능
+            # ---------------------------------------------
             if self.is_cooperation:
-                cur_out = dict()
                 cur_out = {
-                'all_cls_scores': cur_track_instances.cache_logits[None, :, :],
-                'all_bbox_preds': cur_track_instances.cache_bboxes[None, :, :],
-                'track_instances': cur_track_instances
+                    'all_cls_scores': cur_track_instances.cache_logits[None, :, :],  # [1, num_query, num_cls]
+                    'all_bbox_preds': cur_track_instances.cache_bboxes[None, :, :],  # [1, num_query, box_dim]
+                    'track_instances': cur_track_instances
                 }
-                cur_track_instances = self.loss_single_batch(gt_bboxes_3d[j],
-                                   gt_labels_3d[j],
-                                   gt_inds[j],
-                                   cur_out)
+
+                # fused 예측 기반으로 loss 계산
+                cur_track_instances = self.loss_single_batch(
+                    gt_bboxes_3d[j],
+                    gt_labels_3d[j],
+                    gt_inds[j],
+                    cur_out
+                )
+
+                # fused loss는 prefix를 붙여 구분
                 prefix = 'fused_'
                 cur_loss.update({prefix + key: value for key, value in self.criterion.losses_dict.items()})
+
+                # association 학습이 켜져있으면 affinity를 focal loss로 supervision
                 if self.STReasoner.learn_match:
-                    # compute the affine loss (use Focal loss)
+                    # affinity 또는 label이 비정상/empty면 loss=0 처리
                     if affinity.shape[0] == 0 or affinity.shape[1] == 0 or torch.all(asso_label.eq(0)):
                         loss_focal = torch.tensor(0.0, requires_grad=True).to(affinity.device)
                     else:
                         affinity = affinity.view(-1, 1)
                         target = asso_label.view(-1, 1).float()
                         loss_focal = self.asso_loss_focal['loss_weight'] * sigmoid_focal_loss(
-                                        affinity, target, alpha=self.asso_loss_focal['alpha'], 
-                                        gamma=self.asso_loss_focal['gamma'], reduction='mean'
-                                    )
-                    cur_loss.update({'asso_loss': loss_focal,
-                                     'asso_avg_factor': torch.tensor([1.0], device=affinity.device)})
+                            affinity, target,
+                            alpha=self.asso_loss_focal['alpha'],
+                            gamma=self.asso_loss_focal['gamma'],
+                            reduction='mean'
+                        )
 
-            # if self.STReasoner.history_reasoning and not self.is_cooperation:
+                    # avg_factor는 보통 1로 두고 loss만 추가하는 형태
+                    cur_loss.update({
+                        'asso_loss': loss_focal,
+                        'asso_avg_factor': torch.tensor([1.0], device=affinity.device)
+                    })
+
+            # ---------------------------------------------
+            # (D-7) History reasoning loss (memory bank loss)
+            #       - 과거 히스토리를 잘 유지/활용하도록 하는 loss
+            # ---------------------------------------------
             if self.STReasoner.history_reasoning:
-                loss_hist = self.criterion.loss_mem_bank(gt_bboxes_3d[j],
-                                                         gt_labels_3d[j],
-                                                         gt_inds[j],
-                                                         cur_track_instances)
+                loss_hist = self.criterion.loss_mem_bank(
+                    gt_bboxes_3d[j],
+                    gt_labels_3d[j],
+                    gt_inds[j],
+                    cur_track_instances
+                )
                 cur_loss.update(loss_hist)
+
+            # ---------------------------------------------
+            # (D-8) Future reasoning loss (motion forecasting)
+            #       - obj_idxes >= 0 인 active track에 대해서만 미래 궤적 예측 loss를 건다.
+            # ---------------------------------------------
             if self.STReasoner.future_reasoning:
                 active_mask = (cur_track_instances.obj_idxes >= 0)
-                loss_fut = self.forward_loss_prediction(cur_track_instances[active_mask],
-                                                        gt_forecasting_locs[j][0],
-                                                        gt_forecasting_masks[j][0],
-                                                        gt_inds[j][0],
-                                                        img_metas[j])
+                loss_fut = self.forward_loss_prediction(
+                    cur_track_instances[active_mask],
+                    gt_forecasting_locs[j][0],
+                    gt_forecasting_masks[j][0],
+                    gt_inds[j][0],
+                    img_metas[j]
+                )
                 cur_loss.update(loss_fut)
-            # 4. Prepare for next frame
+
+            # =========================================================================
+            # (E) 다음 프레임을 위한 준비: cache -> pred 로 반영 + active track만 남김
+            # =========================================================================
+            # frame_summarization:
+            # - cache_*에 있는 "현재 프레임 최종 결과"를 pred_*로 옮기고
+            # - ref_pts/query_feats/query_embeds 등도 갱신
             cur_track_instances = self.frame_summarization(cur_track_instances, tracking=False)
+
+            # runtime_tracker가 정의한 기준으로 active query 결정 (training용)
             active_mask = self.runtime_tracker.get_active_mask(cur_track_instances, training=True)
+
+            # active query에는 track_query_mask를 True로 설정 (추적 중인 query로 표시)
             cur_track_instances.track_query_mask[active_mask] = True
+
+            # 다음 프레임으로 넘길 active instances만 추출
             active_track_instances = cur_track_instances[active_mask]
-            # import pdb;pdb.set_trace()
+
+            # (E-1) random drop: active track 중 일부를 랜덤으로 제거하여 robustness 학습
             if self.random_drop > 0.0:
                 active_track_instances = self._random_drop_tracks(active_track_instances)
+
+            # (E-2) false positive 추가: inactive query 중 일부를 FP로 섞어 학습 안정성/강건성 증가
             if self.fp_ratio > 0.0:
                 active_track_instances = self._add_fp_tracks(cur_track_instances, active_track_instances)
+
+            # out에는 batch별 "다음 프레임 입력으로 사용할 active instances"만 저장
             out['track_instances'].append(active_track_instances)
+
+            # =========================================================================
+            # (F) loss 누적: avg_factor로 정규화하기 위해 (loss * avg_factor)로 모았다가 마지막에 나눔
+            # =========================================================================
             for key, value in cur_loss.items():
                 if 'loss' not in key:
                     continue
+
+                # mmdet loss 규약: loss_xxx 와 avg_factor가 함께 있음
                 af_key = key.replace('loss', 'avg_factor')
                 avg_factor = cur_loss[af_key]
+
+                # losses에 누적 (가중합 형태)
                 if key not in losses:
                     losses[key] = value * avg_factor
                     avg_factors[af_key] = avg_factor
                 else:
-                    new_value = losses[key] + value * avg_factor
-                    losses[key] = new_value
-                    new_avg_factor = avg_factors[af_key] + avg_factor
-                    avg_factors[af_key] = new_avg_factor
-        
+                    losses[key] = losses[key] + value * avg_factor
+                    avg_factors[af_key] = avg_factors[af_key] + avg_factor
+
+        # =========================================================================
+        # (G) 최종 loss 정규화: 누적된 (loss*avg_factor) / (sum avg_factor)
+        # =========================================================================
         for key, value in losses.items():
             af_key = key.replace('loss', 'avg_factor')
             avg_factor = avg_factors[af_key]
