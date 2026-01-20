@@ -92,7 +92,7 @@ class SpatialTemporalReasoner(nn.Module):
     
     def forward(self, track_instances, inf_track_instances=None, sample_idx=None):
         # 1. Prepare the spatial-temporal features
-        track_instances = self.frame_shift(track_instances)
+        track_instances = self.frame_shift(track_instances) # 가장 오래된 프레임 버퍼를 날리고 현재 프레임 데이터 삽입
 
         affinity = None
         # 2. History reasoning
@@ -114,43 +114,60 @@ class SpatialTemporalReasoner(nn.Module):
         if len(track_instances) == 0:
             return track_instances
         
-        valid_idxes = (track_instances.hist_padding_masks[:, -1] == 0)
-        embed = track_instances.cache_query_feats[valid_idxes]
+        valid_idxes = (track_instances.hist_padding_masks[:, -1] == 0) # valid query만 추리기, [:,-1] => 가장 최근 time slot 즉, “최근 history가 있는 track만 temporal reasoning 하겠다”
+        embed = track_instances.cache_query_feats[valid_idxes] # embed는 현재 프레임 query feature (temporal reasoning의 target이 됨)
 
         if len(embed) == 0:
             return track_instances
         
+        # 이게 temporal transformer의 memory(key/value) 역할.
         hist_embed = track_instances.hist_embeds[valid_idxes]
         hist_padding_mask = track_instances.hist_padding_masks[valid_idxes]
 
+        '''
+        time step마다 (t-2, t-1, t 같은) temporal position 정보를 주기 위해
+	    hist_len 길이의 time positional embedding을 생성
+        '''
         ts_pe = time_position_embedding(hist_embed.shape[0], self.hist_len, 
                                         self.embed_dims, hist_embed.device)
-        ts_pe = self.ts_query_embed(ts_pe)
+        ts_pe = self.ts_query_embed(ts_pe) # latent space로 embedding
+        
+        # Temporal transformer 수행
         temporal_embed = self.hist_temporal_transformer(
-            target=embed[:, None, :], 
-            x=hist_embed, 
-            query_embed=ts_pe[:, -1:, :],
-            pos_embed=ts_pe,
+            target=embed[:, None, :], # 현재 feature를 한 Step짜리 query로 입력
+            x=hist_embed,  # history sequence (K/V)
+            query_embed=ts_pe[:, -1:, :], # query가 참조할 time embed
+            pos_embed=ts_pe, # memory쪽 time embedding
             query_key_padding_mask=hist_padding_mask[:, -1:],
             key_padding_mask=hist_padding_mask)
 
-        hist_pe = track_instances.cache_query_embeds[valid_idxes, None, :]
+        hist_pe = track_instances.cache_query_embeds[valid_idxes, None, :] # 현재 query의 positional embedding
+        
+        # Spatial transformer 수행
+        '''
+        mmcv / mmdet transformer 계열은 종종 입력 shape을 [num_query, batch, C] 형태로 받는 경우가 많음
+        현재 temporal_embed는: [Nv, 1, C] (batch-first), 이를 transformer가 기대하는 형태로 바꾸려는 것:
+        '''
         spatial_embed = self.spatial_transformer(
-            target=temporal_embed.transpose(0, 1),
+            target=temporal_embed.transpose(0, 1), # target과 x를 동일한 temporal_embed를 넣는 이유 => Self attention을 수행하기 때문
             x=temporal_embed.transpose(0, 1),
-            query_embed=hist_pe.transpose(0, 1),
+            query_embed=hist_pe.transpose(0, 1), # 어디에 있는 객체인지가 중요하기 때문에 positional encoding 입력
             pos_embed=hist_pe.transpose(0, 1),
-            query_key_padding_mask=hist_padding_mask[:, -1:].transpose(0, 1),
+            query_key_padding_mask=hist_padding_mask[:, -1:].transpose(0, 1), # Spatial transformer는 현재 query 1개만 처리하기 때문에 최신 마스크만 사용
             key_padding_mask=hist_padding_mask[:, -1:].transpose(0, 1))[0]
 
         if self.is_motion:
+            # motion feature 준비
             mot_embed = track_instances.cache_motion_feats[valid_idxes]
             hist_mot_embed = track_instances.hist_motion_embeds[valid_idxes]
             hist_padding_mask = track_instances.hist_padding_masks[valid_idxes]
 
+            # motion time position embedding
             ts_pe = time_position_embedding(hist_mot_embed.shape[0], self.hist_len, 
                                             self.embed_dims, hist_mot_embed.device)
             ts_pe = self.ts_query_embed(ts_pe)
+            
+            # motion temporal transformer 수행
             mot_embed = self.hist_motion_transformer(
                 target=mot_embed[:, None, :], 
                 x=hist_mot_embed, 
@@ -158,7 +175,7 @@ class SpatialTemporalReasoner(nn.Module):
                 pos_embed=ts_pe,
                 query_key_padding_mask=hist_padding_mask[:, -1:],
                 key_padding_mask=hist_padding_mask)[:, 0, :]
-            track_instances.cache_motion_feats[valid_idxes] = mot_embed.clone()
+            track_instances.cache_motion_feats[valid_idxes] = mot_embed.clone() # cache와 history 마지막 슬롯 업데이트
             track_instances.hist_motion_embeds[valid_idxes, -1] = mot_embed.clone().detach()
         
         track_instances.cache_query_feats[valid_idxes] = spatial_embed.clone()
@@ -167,9 +184,15 @@ class SpatialTemporalReasoner(nn.Module):
     
     def forward_history_refine(self, track_instances: Instances):
         """Refine localization and classification"""
+        '''
+        history reasoning 이후의 feature를 이용해
+	    분류(Classification) + 박스(Localization) 결과를 업데이트
+	    결과는 track_instances.cache_*에 저장됨 (현재 frame의 refined prediction)
+        '''
         if len(track_instances) == 0:
             return track_instances
         
+        # refine할 대상이 있는지 체크
         valid_idxes = (track_instances.hist_padding_masks[:, -1] == 0)
         embed = track_instances.cache_query_feats[valid_idxes]
 
@@ -180,21 +203,22 @@ class SpatialTemporalReasoner(nn.Module):
         logits = self.track_cls(track_instances.cache_query_feats[valid_idxes])
         # track_instances.hist_logits[valid_idxes, -1, :] = logits.clone()
         track_instances.cache_logits[valid_idxes] = logits.clone()
-        track_instances.cache_scores = logits.sigmoid().max(dim=-1).values
+        # cache_scores는 이후에 aggregation에서 mask threshold(veh_thre) 로 쓰임
+        track_instances.cache_scores = logits.sigmoid().max(dim=-1).values # DETR류 tracking에서는 이렇게 “objectness처럼 쓰는 score”를 만듦
 
         """Localization"""
         if self.is_motion:
-            deltas = self.track_reg(track_instances.cache_motion_feats[valid_idxes])
+            deltas = self.track_reg(track_instances.cache_motion_feats[valid_idxes]) # box regression을 motion feature 기반으로 함
         else:
             deltas = self.track_reg(track_instances.cache_query_feats[valid_idxes])
-        reference = inverse_sigmoid(track_instances.cache_ref_pts[valid_idxes].clone())
-        deltas[..., [0, 1, 4]] += reference
+        reference = inverse_sigmoid(track_instances.cache_ref_pts[valid_idxes].clone()) # DETR 계열의 box refine 트릭과 동일한 방식
+        deltas[..., [0, 1, 4]] += reference # ref point를 기준으로 한 residual update
         deltas[..., [0, 1, 4]] = deltas[..., [0, 1, 4]].sigmoid()
 
-        track_instances.cache_ref_pts[valid_idxes] = deltas[..., [0, 1, 4]].clone()
+        track_instances.cache_ref_pts[valid_idxes] = deltas[..., [0, 1, 4]].clone() # 다음 refine 단계와 tracking 단계에서 쓸 ref_pts를 update
         # track_instances.hist_xyz[valid_idxes, -1, :] = deltas[..., [0, 1, 4]].clone()
         deltas[..., [0, 1, 4]] = denormalize(deltas[..., [0, 1, 4]], self.pc_range)
-        track_instances.cache_bboxes[valid_idxes, :] = deltas
+        track_instances.cache_bboxes[valid_idxes, :] = deltas # cache_bboxes는 denormalize로 world 좌표로 저장, cache_ref_pts는 normalize된 값
         # track_instances.hist_bboxes[valid_idxes, -1, :] = deltas.clone()
         return track_instances
 
@@ -224,9 +248,11 @@ class SpatialTemporalReasoner(nn.Module):
         # 1. association
         veh_ref_pts = veh_instances.cache_ref_pts.clone()
         inf_ref_pts = inf_instances.cache_ref_pts.clone()
+        # normalize 좌표를 world 좌표로 변환 (matching을 distance기반으로 하기 때문)
         veh_abs_pts = self._loc_denorm(veh_ref_pts, self.pc_range)
         inf_abs_pts = self._loc_denorm(inf_ref_pts, self.pc_range)
 
+        # 차량 query중 confidence 낮은 것 제거용 mask
         mask = veh_instances.cache_scores > self.veh_thre
         
         affinity = None
@@ -235,17 +261,30 @@ class SpatialTemporalReasoner(nn.Module):
             veh_idx, inf_idx, _ = self._query_matching(inf_abs_pts, veh_abs_pts, mask)
         else:
             # learning match
+            """
+            veh/inf의 query feature + motion feature를 node로 만들고
+            거리 차이를 edge feature로 만들고
+            q,k,e 기반 attention score(attn) 생성
+            sigmoid → affinity(유사도)
+            Hungarian assignment로 최종 매칭 idx 추출
+            """
             veh_idx, inf_idx, affinity = self._learn_matching(inf_instances, veh_instances, inf_abs_pts, veh_abs_pts, mask)
+            '''
+            학습 중에는 _learn_matching()이 idx를 반환하지 않고 attn만 반환하거나 매칭이 불안정할 수 있음
+            그래서 “학습 중 forward에서는 안정적인 rule-based idx를 쓰고”
+            대신 affinity(attn)는 loss 계산을 위해 유지
+            '''
             if self.training:
                 veh_idx, inf_idx, _ = self._query_matching(inf_abs_pts, veh_abs_pts, mask)
 
         # 2. aggregation
-        fused_instances = self._query_fusion(inf_instances, veh_instances, inf_idx, veh_idx)
-        res_instances = self._query_complementation(inf_instances, veh_instances, inf_idx, veh_idx, fused_instances)
+        fused_instances = self._query_fusion(inf_instances, veh_instances, inf_idx, veh_idx) # match vehicle query와 infra query를 concat 후 MLP
+        res_instances = self._query_complementation(inf_instances, veh_instances, inf_idx, veh_idx, fused_instances) # unmatched infra query를 추가 + 일부 unmatched vehicle query 유지
 
+        # query feature로는 부족하니 domain gap을 위해 positional embedding을 넣어서 domain gap 보완
         res_instances.cache_query_feats = self.cross_domain_query(torch.cat([res_instances.cache_query_feats, res_instances.cache_query_embeds], dim=-1))
         res_instances.cache_motion_feats = self.cross_domain_motion(torch.cat([res_instances.cache_motion_feats, res_instances.cache_query_embeds], dim=-1))
-        return res_instances, affinity
+        return res_instances, affinity # 최종 통합 query set, loss용 affinity
 
     def _query_fusion(self, inf, veh, inf_idx, veh_idx):
         """
@@ -637,8 +676,10 @@ class SpatialTemporalReasoner(nn.Module):
         return track_instances
     
     def frame_shift(self, track_instances: Instances):
-        """Shift the information for the newest frame before spatial-temporal reasoning happens. 
-           Pay attention to the order.
+        """
+        Shift the information for the newest frame before spatial-temporal reasoning happens. 
+        Pay attention to the order.
+        가장 오래된 frame 정보를 버리고 현재 frame 업데이트
         """
         device = track_instances.query_feats.device
         
@@ -646,11 +687,19 @@ class SpatialTemporalReasoner(nn.Module):
         # embeds
         track_instances.hist_embeds = track_instances.hist_embeds.clone()
         track_instances.hist_embeds = torch.cat((
-            track_instances.hist_embeds[:, 1:, :], track_instances.cache_query_feats[:, None, :]), dim=1)
+            # hist_embeds[:,1:,:] => 가장 오래된 슬롯(0번째)을 버리고 뒤만 남김, [:, None, :] => 현재 프레임 query feature를 time dim으로 확장해서 붙임
+            track_instances.hist_embeds[:, 1:, :], track_instances.cache_query_feats[:, None, :]), dim=1) 
+        '''
+            before: [t-h+1, t-h+2, ..., t-1]
+            after : [t-h+2, t-h+3, ..., t]
+            즉, 현재 cache_query_feats가 history의 “마지막 프레임”이 됨
+        '''
+        
         # padding masks
+        # MHA 스타일 padding mask, True = pad, False = valid
         track_instances.hist_padding_masks = torch.cat((
             track_instances.hist_padding_masks[:, 1:], 
-            torch.zeros((len(track_instances), 1), dtype=torch.bool, device=device)), 
+            torch.zeros((len(track_instances), 1), dtype=torch.bool, device=device)),  # oldest를 버리고 False(0)를 붙임
             dim=1)
         # positions
         track_instances.hist_xyz = torch.cat((
