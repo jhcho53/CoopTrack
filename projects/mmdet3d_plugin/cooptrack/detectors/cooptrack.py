@@ -836,48 +836,161 @@ class CoopTrack(MVXTwoStageDetector):
         return track_instances
     
     def loss_single_batch(self, gt_bboxes_3d, gt_labels_3d, gt_inds, pred_dict):
-        # init gt instances!
-        gt_instances_list = []
-        device = self.reference_points.weight.device
+        """
+        [한 프레임의 detection loss 계산 + matching 결과를 track_instances에 기록하는 함수]
+
+        역할 요약:
+        1) GT 박스/라벨/ID(gt_inds)를 Instances 형태로 구성해서 criterion에 등록
+        2) DETR-style decoder layer별 예측값(cls, bbox)을 track_instances에 넣어줌
+        3) 각 decoder layer마다 Hungarian matching을 수행해서
+        - 어떤 query가 어떤 GT에 매칭되는지 결정
+        - 매칭된 결과를 track_instances에 저장 (matched_gt_idxes, iou 등)
+        4) 최종 decoder layer(nb_dec-1)의 track_instances를 리턴
+
+        입력:
+        gt_bboxes_3d: list 형태 (batch 차원 포함)
+            - 여기서는 bs=1 구조라서 gt_bboxes_3d[0]을 사용
+            - gt_bboxes_3d[0].tensor: [N_gt, 9 또는 10] 형태의 GT box
+
+        gt_labels_3d: list
+            - gt_labels_3d[0]: [N_gt] 각 GT box의 class id
+
+        gt_inds: list
+            - gt_inds[0]: [N_gt] 각 GT 객체의 "고유 object id"
+            - tracking에서 동일 객체를 추적하기 위해 사용됨
+
+        pred_dict: detector output과 track_instances가 묶인 dict
+            - pred_dict['all_cls_scores']: [num_decoder_layers, num_query, num_cls]
+            - pred_dict['all_bbox_preds']: [num_decoder_layers, num_query, box_dim]
+            - pred_dict['track_instances']: 현재 프레임의 query container (Instances)
+        """
+
+        # ------------------------------------------------------------
+        # 0) GT Instances 구성 (criterion이 matching/loss 계산할 수 있게 준비)
+        # ------------------------------------------------------------
+
+        gt_instances_list = []  # criterion이 받는 형태: GT Instances 리스트
+        device = self.reference_points.weight.device  # 모델이 올라간 device
+
+        # GT도 track_instances와 같은 "Instances" 포맷으로 만들어준다.
+        # Instances((1,1))은 보통 더미 shape로 생성한 뒤 필드를 직접 채우는 방식
         gt_instances = Instances((1, 1))
+
+        # GT 박스 가져오기 (bs=1이므로 첫 번째만 사용)
+        # gt_bboxes_3d[0].tensor: 실제 3D box tensor
         boxes = gt_bboxes_3d[0].tensor.to(device)
-        # normalize gt bboxes here!
+
+        # normalize_bbox:
+        # - DETR 계열에서는 박스를 [0~1] 범위의 normalized 좌표로 두고 학습하는 경우가 많음
+        # - pc_range(예: [-51.2, -51.2, -5.0, 51.2, 51.2, 3.0]) 기준으로 normalize
         boxes = normalize_bbox(boxes, self.pc_range)
-        gt_instances.boxes = boxes
-        gt_instances.labels = gt_labels_3d[0]
-        gt_instances.obj_ids = gt_inds[0]
+
+        # GT Instances 내부 필드 채우기
+        gt_instances.boxes = boxes                 # [N_gt, box_dim] normalized GT boxes
+        gt_instances.labels = gt_labels_3d[0]      # [N_gt] GT class label
+        gt_instances.obj_ids = gt_inds[0]          # [N_gt] GT object tracking id
+
+        # criterion은 list로 GT를 받도록 설계된 경우가 많음
         gt_instances_list.append(gt_instances)
+
+        # criterion 내부에 GT 정보 저장 (clip 단위/프레임 단위 초기화)
+        # ex) matcher가 GT를 알고 있어야 query↔GT assignment 가능
         self.criterion.initialize_for_single_clip(gt_instances_list)
 
-        output_classes = pred_dict['all_cls_scores']
-        output_coords = pred_dict['all_bbox_preds']
-        track_instances = pred_dict['track_instances']
+        # ------------------------------------------------------------
+        # 1) detector 예측 결과 꺼내오기
+        # ------------------------------------------------------------
+        output_classes = pred_dict['all_cls_scores']  # [nb_dec, num_query, num_cls]
+        output_coords  = pred_dict['all_bbox_preds']  # [nb_dec, num_query, box_dim]
+        track_instances = pred_dict['track_instances']  # query container
+
+        # ------------------------------------------------------------
+        # 2) track_scores 계산 (objectness처럼 쓰는 score)
+        # ------------------------------------------------------------
+        # DETR류에서는 per-query class logit이 나오므로
+        # sigmoid 후 가장 높은 클래스 확률(max)을 그 query의 confidence로 사용
+        # track_scores: [num_query]
+        # with torch.no_grad():
+        #   - score 계산은 loss backprop에 불필요하므로 gradient 끊음
         with torch.no_grad():
             track_scores = output_classes[-1].sigmoid().max(dim=-1).values
+            # output_classes[-1] -> 마지막 decoder layer output 사용
+            # .sigmoid() -> multi-label 형태 확률화
+            # .max(dim=-1) -> 클래스 중 가장 높은 값 = query confidence
+            # .values -> max값만 가져옴 (argmax는 버림)
 
-        # Step-1 Update track instances with current prediction
-        # [nb_dec, num_query, xxx]
+        # ------------------------------------------------------------
+        # 3) decoder layer 개수 구하기
+        # ------------------------------------------------------------
+        # output_classes.size(0) == nb_dec (decoder layer 수)
         nb_dec = output_classes.size(0)
 
-        # the track id will be assigned by the matcher.
+        # ------------------------------------------------------------
+        # 4) 각 decoder layer별 track_instances 준비
+        # ------------------------------------------------------------
+        # 중요한 이유:
+        # - decoder layer마다 예측이 달라지고, 각 layer별로 matching/loss를 계산하는 구조
+        # - 하지만 track_instances는 "하나의 객체"라서,
+        #   layer별로 pred_boxes/pred_logits 등을 저장하려면 복사본이 필요함
+        #
+        # 그래서:
+        #   - 앞의 (nb_dec-1)개 layer는 _copy_tracks_for_loss()로 "복제본"을 만들고
+        #   - 마지막 layer는 원본 track_instances를 그대로 사용
+        #
+        # copy는 obj_idxes/matched_gt_idxes 같은 tracking 상태는 유지하면서
+        # pred_logits/pred_boxes 같은 값은 새로 채우는 용도로 쓰임
         track_instances_list = [
             self._copy_tracks_for_loss(track_instances) for i in range(nb_dec - 1)
         ]
-        track_instances_list.append(track_instances)
-        
-        single_out = {}
+        track_instances_list.append(track_instances)  # 마지막 layer는 원본을 그대로 사용
+
+        # ------------------------------------------------------------
+        # 5) decoder layer별 matching 수행 (Hungarian assignment)
+        # ------------------------------------------------------------
+        single_out = {}  # criterion.match_for_single_frame에 넣을 dict 형태
+
         for i in range(nb_dec):
+            # i번째 decoder layer에 대응하는 track_instances 가져오기
             track_instances_tmp = track_instances_list[i]
 
+            # (1) scores 기록
+            # track_instances_tmp.scores: [num_query]
+            # 여기서 score는 "query confidence"로 활용됨
             track_instances_tmp.scores = track_scores
-            track_instances_tmp.pred_logits = output_classes[i]  # [300, num_cls]
-            track_instances_tmp.pred_boxes = output_coords[i]  # [300, box_dim]
 
+            # (2) logits 기록
+            # output_classes[i]: [num_query, num_cls]
+            # query별 classification prediction
+            track_instances_tmp.pred_logits = output_classes[i]
+
+            # (3) bbox 기록
+            # output_coords[i]: [num_query, box_dim]
+            # query별 bbox regression prediction
+            track_instances_tmp.pred_boxes = output_coords[i]
+
+            # criterion 내부 matcher는 "single_out['track_instances']"를 보고
+            # query 예측과 GT를 비교해서 matching 수행함
             single_out["track_instances"] = track_instances_tmp
+
+            # match_for_single_frame:
+            # - Hungarian matching 수행
+            # - query ↔ GT 최적 할당을 계산
+            # - 그 결과를 track_instances_tmp 내부 필드에 저장
+            #   (예: matched_gt_idxes, iou, obj_idxes 등)
+            #
+            # if_step = True인 경우:
+            # - 보통 마지막 decoder layer에서만 최종 step으로 처리
+            # - 예: tracking id 업데이트 / loss weight 적용 / 기록 등
             track_instances_tmp, matched_indices = self.criterion.match_for_single_frame(
-                single_out, i, if_step=(i == (nb_dec - 1))
+                single_out,
+                i,
+                if_step=(i == (nb_dec - 1))  # 마지막 decoder layer만 True
             )
-        
+
+        # ------------------------------------------------------------
+        # 6) 최종 decoder layer의 track_instances 반환
+        # ------------------------------------------------------------
+        # 즉, "matching과 loss 계산이 반영된 최종 layer 결과"를 반환
         return track_instances_tmp
 
     def forward_loss_prediction(self, 

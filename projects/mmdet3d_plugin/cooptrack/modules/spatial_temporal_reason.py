@@ -724,32 +724,102 @@ class SpatialTemporalReasoner(nn.Module):
 
     def _query_complementation(self, inf, veh, inf_accept_idx, veh_accept_idx, fused):
         """
-        Query complementation: replace low-confidence vehicle-side query with unmatched inf-side query
+        [Query complementation]
+        - vehicle과 infrastructure query를 matching해서 fused query를 만든 뒤에도
+        매칭되지 않은 query들이 남는다.
+        - 이 함수는 "최종 query set"을 만들 때,
+        (1) fused query는 무조건 포함하고
+        (2) 매칭되지 않은 infra query는 추가로 포함하여 vehicle을 보완하고
+        (3) 매칭되지 않은 vehicle query는 '점수 높은 것(top-k)'만 골라 일부 유지한다.
 
-        inf: Instance from infrastructure
-        veh: Instance from vehicle
-        inf_accept_idx: idxs of matched instances
+        즉, 최종 query 구성은 다음과 같다:
+        최종 결과 = [ fused(매칭된 쌍) + unmatched infra(보완) + top-k unmatched veh(필요하면 유지) ]
+
+        Args:
+            inf: infrastructure 측 Instances (query set)
+            veh: vehicle 측 Instances (query set)
+            inf_accept_idx: (매칭 성공한) infra query 인덱스들
+            veh_accept_idx: (매칭 성공한) vehicle query 인덱스들
+            fused: veh-inf 매칭 쌍을 fusion한 Instances 결과
         """
-        veh_num = len(veh)
-        inf_num = len(inf)
 
-        mask = torch.ones(veh_num, dtype=bool)
-        mask[veh_accept_idx] = False
+        # ------------------------------------------------------------
+        # 0) 전체 query 개수 파악
+        # ------------------------------------------------------------
+        veh_num = len(veh)   # vehicle query 개수
+        inf_num = len(inf)   # infrastructure query 개수
+
+        # ------------------------------------------------------------
+        # 1) "매칭되지 않은 vehicle query" 추출
+        # ------------------------------------------------------------
+        # mask를 True로 만들어둔 뒤,
+        # 매칭된 veh index는 False로 바꿔서 unmatched만 남기기
+        mask = torch.ones(veh_num, dtype=bool)   # [veh_num] True로 시작
+        mask[veh_accept_idx] = False             # 매칭된 veh query는 제외(False)
+
+        # veh[mask] -> 매칭되지 않은 vehicle query만 남음
         unmatched_veh = veh[mask]
 
-        mask = torch.ones(inf_num, dtype=bool)
-        mask[inf_accept_idx] = False
+        # ------------------------------------------------------------
+        # 2) "매칭되지 않은 infra query" 추출
+        # ------------------------------------------------------------
+        mask = torch.ones(inf_num, dtype=bool)   # [inf_num] True로 시작
+        mask[inf_accept_idx] = False             # 매칭된 infra query는 제외(False)
+
+        # inf[mask] -> 매칭되지 않은 infra query만 남음
         unmatched_inf = inf[mask]
+
+        # ------------------------------------------------------------
+        # 3) 최종 결과로 만들 Instances 컨테이너 생성
+        # ------------------------------------------------------------
+        # res_instances는 비어있는 Instances로 시작
+        # (Instances.cat이 편하게 쓰이도록 placeholder로 하나 만들어둠)
         res_instances = Instances((1, 1))
+
+        # ------------------------------------------------------------
+        # 4) fused query 먼저 추가
+        # ------------------------------------------------------------
+        # matched veh-inf pair는 "이미 같은 물체라고 판단된 쌍"이므로
+        # fusion된 fused query는 최우선으로 포함
         res_instances = Instances.cat([res_instances, fused])
+
+        # ------------------------------------------------------------
+        # 5) 매칭되지 않은 infra query 추가 (보완/complementation 핵심!)
+        # ------------------------------------------------------------
+        # vehicle query가 놓친 물체를 infra가 잡았을 수도 있기 때문에
+        # unmatched infra query는 그대로 최종 query set에 추가한다.
         res_instances = Instances.cat([res_instances, unmatched_inf])
 
+        # ------------------------------------------------------------
+        # 6) 매칭되지 않은 veh query는 일부만 골라서 유지 (top-k)
+        # ------------------------------------------------------------
+        # select_num = veh_num - inf_num 의미:
+        # - "vehicle query 개수"와 "infra query 개수" 차이만큼
+        #   unmatched vehicle query를 추가로 유지시키겠다는 의도
+        #
+        # 예시:
+        #   veh_num=900, inf_num=600 -> select_num=300
+        #   -> vehicle 쪽 unmatched query 중 점수 높은 300개만 남김
+        #
+        # 단, 여기서 주의할 점:
+        # - inf_num이 veh_num보다 큰 경우 select_num이 음수가 됨
+        #   -> torch.topk에 음수 들어가면 에러 발생 가능
         select_num = veh_num - inf_num
+
+        # unmatched_veh.cache_scores:
+        # - query별 confidence score (objectness처럼 사용)
+        #
+        # topk_indexes:
+        # - unmatched vehicle query 중 score 높은 select_num개 인덱스
         _, topk_indexes = torch.topk(unmatched_veh.cache_scores, select_num, dim=0)
+
+        # 선택된 top-k unmatched veh query만 최종 결과에 추가
         res_instances = Instances.cat([res_instances, unmatched_veh[topk_indexes]])
 
+        # ------------------------------------------------------------
+        # 7) 최종 query set 반환
+        # ------------------------------------------------------------
         return res_instances
-    
     def _loc_denorm(self, ref_pts, pc_range):
         """
         normalized (x,y,z) ---> absolute (x,y,z) in global coordinate system
